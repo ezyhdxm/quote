@@ -13,6 +13,7 @@ from plotly.subplots import make_subplots
 from IPython.display import display
 
 EDA_CONFIG = {
+    "QUOTES_PATH": None, "TRADES_PATH": None, "BOND_INFO_PATH": None,
     "ISSUER": None,                    # None selects the issuer with most quoted bonds
     "START": None, "END": None,        # ET, e.g. "2026-03-02 08:00"
     "GRID": "5min", "MAX_AGE": "30min",
@@ -22,7 +23,10 @@ EDA_CONFIG = {
     "QUOTE_SPREAD_MULTIPLIER": 1.0,     # screenshot: spread already in bps
     "TRADE_SPREAD_MULTIPLIER": 100.0,   # screenshot: BM_SPREAD * 100
     "QUOTE_AVAILABLE_COL": None,       # optional receipt/availability timestamp
-    "PAIR_MAX_GAP": "5min",
+    "QUOTE_SEQUENCE_COL": None,        # optional feed sequence for timestamp ties
+    "NONPOSITIVE_QUANTITY_IS_MISSING": True,  # keeps quantity_raw for audit
+    "ZERO_SPREAD_IS_MISSING": True,     # dataset-specific; raw values stay visible
+    "PAIR_MAX_GAP": "5min", "PAIR_ALLOW_UNKNOWN_SIZE": True,
     "NOISE_FLOOR_BPS": 2.0, "PEER_Z": 4.0, "MIN_PEER_DEALERS": 3,
     "CHANGE_LAG": "30min", "ANALYSIS_SIDE": "bid",
     "MIN_MATCHED_DEALERS": 2, "MIN_COMMON_OBS": 30,
@@ -41,17 +45,28 @@ M_COL = {"cusip": "CUSIP", "issuer": "ISSUER", "tenor": "YRS_TO_MATURITY"}
 if C["USE_DEMO"]:
     from demo_data import make_demo
     bcq_df, data_ig, bond_info_df = make_demo()
+if C["QUOTES_PATH"] is not None:
+    bcq_df = pd.read_parquet(C["QUOTES_PATH"])  # full quotes; no trade-CUSIP filter
+if C["TRADES_PATH"] is not None:
+    data_ig = pd.read_parquet(C["TRADES_PATH"])
+if C["BOND_INFO_PATH"] is not None:
+    bond_info_df = pd.read_parquet(C["BOND_INFO_PATH"])
 if "bcq_df" not in globals():
     raise ValueError("Load bcq_df first, or set USE_DEMO=True in cell 1.")
+if Q_COL["event_time"] not in bcq_df and "quote_timestamp_UTC" in bcq_df:
+    bcq_df = bcq_df.assign(quote_timestamp_ET=pd.to_datetime(
+        bcq_df["quote_timestamp_UTC"], utc=True, errors="coerce").dt.tz_convert("America/New_York"))
 trade_input = globals().get("data_ig", pd.DataFrame(columns=list(T_COL.values())))
 metadata_input = globals().get("bond_info_df")
 figures = {}
 
 # %% [markdown]
 # ## Normalize and audit without using trades to clean quotes
-# Missing/invalid spread records still replace earlier dealer records. Zero and
-# negative spreads remain visible. Timestamp ties use the last input row; if the
-# feed has a sequence number, sort the input by that number before running.
+# Invalid latest records replace earlier records without reviving an old quote.
+# Nonpositive size is unknown by default; quantity_raw preserves the input.
+# Zero spread is excluded from analysis by default but remains visible in raw
+# plots. Disable ZERO_SPREAD_IS_MISSING if exact zero is a valid spread in your feed.
+# Timestamp ties use QUOTE_SEQUENCE_COL, or the last input row when unavailable.
 # Naive times use the configured source zone; aware times are converted to ET.
 # With no receipt timestamp, replay assumes quotes were available at event time.
 
@@ -81,6 +96,10 @@ q["known_time"] = (to_et(bcq_df[C["QUOTE_AVAILABLE_COL"]], C["Q_NAIVE_TZ"])
 t["time"] = to_et(t["time"], C["T_NAIVE_TZ"])
 t["type"] = t.get("type", pd.Series("?", index=t.index)).astype("string")
 q["input_row"] = np.arange(len(q))
+q["sequence"] = (pd.to_numeric(bcq_df[C["QUOTE_SEQUENCE_COL"]], errors="coerce").fillna(q["input_row"])
+                 if C["QUOTE_SEQUENCE_COL"] else q["input_row"])
+q["quantity_raw"] = q["quantity"]
+q["spread_valid"] = q["spread"].notna() & (~q["spread"].eq(0) if C["ZERO_SPREAD_IS_MISSING"] else True)
 key = ["cusip", "firm", "side"]
 valid_key = q[key + ["event_time", "known_time"]].notna().all(axis=1)
 valid_key &= q["side"].isin(["bid", "ask"])
@@ -92,12 +111,16 @@ audit = pd.Series({
     "nonpositive_quantity_rows": int(q["quantity"].le(0).sum()),
     "event_after_availability_rows": int(q["event_time"].gt(q["known_time"]).sum()),
 }, name="rows")
-q = q.loc[valid_key].sort_values(["known_time", "event_time", "input_row"], kind="stable")
+q = q.loc[valid_key].sort_values(["known_time", "event_time", "sequence", "input_row"], kind="stable")
 payload = key + ["event_time", "known_time", "spread", "quantity"]
 audit["exact_duplicate_rows"] = q.duplicated(payload, keep="last").sum()
-conflicts = q.groupby(key + ["known_time"], observed=True)["spread"].nunique(dropna=False)
+conflicts = q.drop_duplicates(key + ["known_time", "spread", "quantity"]).groupby(key + ["known_time"], observed=True).size()
 audit["conflicting_timestamp_groups"] = conflicts.gt(1).sum()
 q = q.drop_duplicates(payload, keep="last").reset_index(drop=True)
+timestamp_conflict_sample = q.loc[q.duplicated(key + ["known_time"], keep=False)].head(20)
+if C["NONPOSITIVE_QUANTITY_IS_MISSING"]:
+    q["quantity"] = q["quantity"].where(q["quantity"].gt(0))
+audit["quantity_unknown_after_normalization"] = q["quantity"].isna().sum()
 # Late arrivals cannot replace an already known newer event from the same key.
 event_watermark = q["event_time"].where(q["event_time"].le(q["known_time"]))
 event_watermark = event_watermark.groupby([q[k] for k in key]).cummax()
@@ -110,24 +133,32 @@ t = t.dropna(subset=["cusip", "time"]).sort_values("time", kind="stable")
 # Structural metadata only; trade fallback is for EDA grouping, not feature replay.
 meta_parts = []
 if metadata_input is not None:
-    meta_parts.append(metadata_input.reindex(columns=list(M_COL.values())))
+    meta_parts.append(metadata_input.reindex(columns=list(M_COL.values())).assign(_priority=2))
+if M_COL["issuer"] in bcq_df:
+    quote_meta = pd.DataFrame({M_COL["cusip"]: bcq_df[Q_COL["cusip"]],
+                               M_COL["issuer"]: bcq_df[M_COL["issuer"]],
+                               M_COL["tenor"]: bcq_df.get(M_COL["tenor"], np.nan)})
+    meta_parts.append(quote_meta.drop_duplicates().assign(_priority=1))
 if "CUSIP" in trade_input and "ISSUER" in trade_input:
     fallback = trade_input.reindex(columns=list(M_COL.values())).copy()
     fallback["_time"] = to_et(trade_input[T_COL["time"]], C["T_NAIVE_TZ"])
-    meta_parts.append(fallback.sort_values("_time").drop(columns="_time"))
+    meta_parts.append(fallback.sort_values("_time").drop(columns="_time").assign(_priority=0))
 if not meta_parts:
-    raise ValueError("Supply bond_info_df with CUSIP/ISSUER, or ISSUER in data_ig.")
+    raise ValueError("Supply bond_info_df with CUSIP/ISSUER, or ISSUER in quotes/trades.")
 meta = pd.concat(meta_parts, ignore_index=True).rename(columns={v: k for k, v in M_COL.items()})
 meta["cusip"] = meta["cusip"].astype("string").str.strip().replace("", pd.NA)
 meta["issuer"] = meta["issuer"].astype("string").str.strip().replace("", pd.NA)
 meta["tenor"] = pd.to_numeric(meta["tenor"], errors="coerce")
-# Static metadata has priority; latest trade fallback has priority among trades.
-static_n = len(metadata_input) if metadata_input is not None else 0
-meta["_priority"] = np.r_[np.ones(static_n), np.zeros(len(meta) - static_n)]
+# Static metadata, then quote metadata, then latest trade fallback.
 meta = (meta.dropna(subset=["cusip", "issuer"]).sort_values("_priority", kind="stable")
         .groupby("cusip", sort=False).last()[["issuer", "tenor"]])
 unmapped_quote_cusips = sorted(set(q["cusip"].dropna()) - set(meta.index))
 display(audit.to_frame())
+print("Quote-only bonds require full input quotes and issuer metadata; do not prefilter by data_ig.CUSIP.")
+print(f"Policies: nonpositive size -> unknown={C['NONPOSITIVE_QUANTITY_IS_MISSING']}; exclude zero spread={C['ZERO_SPREAD_IS_MISSING']}.")
+if len(timestamp_conflict_sample):
+    print("Timestamp tie examples; use a feed sequence or investigate concurrent size slots.")
+    display(timestamp_conflict_sample)
 if unmapped_quote_cusips:
     print(f"{len(unmapped_quote_cusips)} quoted CUSIPs have no issuer metadata; supply bond_info_df.")
     display(pd.DataFrame({"unmapped_cusip": unmapped_quote_cusips[:30]}))
@@ -195,9 +226,12 @@ previous = state_messages.groupby(key, sort=False)[["spread", "quantity"]].shift
 same_spread = state_messages["spread"].eq(previous["spread"]) | (state_messages["spread"].isna() & previous["spread"].isna())
 same_qty = state_messages["quantity"].eq(previous["quantity"]) | (state_messages["quantity"].isna() & previous["quantity"].isna())
 state_messages["value_changed"] = ~(same_spread & same_qty) | state_messages.groupby(key).cumcount().eq(0)
+state_messages["spread_changed"] = ~same_spread | state_messages.groupby(key).cumcount().eq(0)
 state_messages["last_change_time"] = state_messages["known_time"].where(state_messages["value_changed"])
 state_messages["last_change_time"] = state_messages.groupby(key, sort=False)["last_change_time"].ffill()
-iq = iq.join(state_messages[["value_changed", "last_change_time"]])
+state_messages["last_spread_change_time"] = state_messages["known_time"].where(state_messages["spread_changed"])
+state_messages["last_spread_change_time"] = state_messages.groupby(key, sort=False)["last_spread_change_time"].ffill()
+iq = iq.join(state_messages[["value_changed", "spread_changed", "last_change_time", "last_spread_change_time"]])
 iq["gap_min"] = iq.groupby(key)["known_time"].diff().dt.total_seconds() / 60
 parts = []
 for _, messages in state_messages.groupby(key, sort=False):
@@ -210,35 +244,59 @@ for _, messages in state_messages.groupby(key, sort=False):
 states = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 if states.empty:
     raise ValueError("No quote records are known before the chosen snapshots.")
+# merge_asof can promote booleans to object when early snapshots have no match.
+states["spread_valid"] = states["spread_valid"].astype(bool)
 states["age_min"] = (states["time"] - states["event_time"]).dt.total_seconds() / 60
 states["value_age_min"] = (states["time"] - states["last_change_time"]).dt.total_seconds() / 60
-states["fresh"] = (states["age_min"].between(0, max_age.total_seconds() / 60)
-                   & states["spread"].notna()
-                   & states["event_time"].le(states["known_time"]))
-active = states.loc[states["fresh"]].copy()
+states["spread_age_min"] = (states["time"] - states["last_spread_change_time"]).dt.total_seconds() / 60
+states["clock_fresh"] = (states["age_min"].between(0, max_age.total_seconds() / 60)
+                         & states["event_time"].le(states["known_time"]))
+states["fresh"] = states["clock_fresh"] & states["spread"].notna()
+states["usable"] = states["fresh"] & states["spread_valid"]
+active_raw = states.loc[states["fresh"]].copy()
+active = states.loc[states["usable"]].copy()
 gkey = ["time", "cusip", "side"]
 active["peer_center"] = active.groupby(gkey)["spread"].transform("median")
 active["peer_residual"] = active["spread"] - active["peer_center"]
 active["peer_mad"] = active["peer_residual"].abs().groupby([active[k] for k in gkey]).transform("median")
 active["peer_n"] = active.groupby(gkey)["firm"].transform("nunique")
+active["peer_assessed"] = active["peer_n"].ge(C["MIN_PEER_DEALERS"])
 active["peer_z"] = active["peer_residual"] / (1.4826 * active["peer_mad"]).clip(lower=C["NOISE_FLOOR_BPS"])
-active["peer_flag"] = active["peer_n"].ge(C["MIN_PEER_DEALERS"]) & active["peer_z"].abs().gt(C["PEER_Z"])
+active["peer_flag"] = active["peer_assessed"] & active["peer_z"].abs().gt(C["PEER_Z"])
 active["age_weight"] = np.exp(-active["age_min"] / (max_age.total_seconds() / 60))
-side_stats = active.groupby(gkey).agg(
+clean_active = active.loc[~active["peer_flag"]].copy()
+raw_side_stats = active_raw.groupby(gkey).agg(
+    median=("spread", "median"), p25=("spread", lambda x: x.quantile(.25)),
+    p75=("spread", lambda x: x.quantile(.75)), n_dealers=("firm", "nunique"))
+side_stats = clean_active.groupby(gkey).agg(
     median=("spread", "median"), p25=("spread", lambda x: x.quantile(.25)),
     p75=("spread", lambda x: x.quantile(.75)), n_dealers=("firm", "nunique"),
     age_min=("age_min", "median"), flagged_fraction=("peer_flag", "mean"))
-side_stats["median_without_flags"] = active.loc[~active["peer_flag"]].groupby(gkey)["spread"].median()
+side_stats["median_before_peer_filter"] = active.groupby(gkey)["spread"].median()
+side_stats["n_before_peer_filter"] = active.groupby(gkey)["firm"].nunique()
+side_stats["flagged_fraction"] = active.groupby(gkey)["peer_flag"].mean()
+side_stats["peer_assessed_fraction"] = active.groupby(gkey)["peer_assessed"].mean()
 side_stats["effective_dealers_age"] = (
-    active.groupby(gkey)["age_weight"].sum() ** 2
-    / active["age_weight"].pow(2).groupby([active[k] for k in gkey]).sum())
-print(f"{len(states):,} cached records; {len(active):,} fresh finite records.")
-print("Peer flags compare same-bond, same-side dealers; flags are retained in the main median.")
+    clean_active.groupby(gkey)["age_weight"].sum() ** 2
+    / clean_active["age_weight"].pow(2).groupby([clean_active[k] for k in gkey]).sum())
+snapshot_funnel = pd.DataFrame([
+    {"stage": label, "records": len(frame), "bonds": frame["cusip"].nunique(),
+     "bond_side_snapshots": frame[gkey].drop_duplicates().shape[0]}
+    for label, frame in [("cached latest states", states),
+                          ("fresh clock", states.loc[states["clock_fresh"]]),
+                          ("finite spread, including zero", active_raw),
+                          ("spread validity policy", active), ("after peer filter", clean_active)]
+]).set_index("stage")
+snapshot_funnel["fraction_of_previous"] = snapshot_funnel["records"].div(snapshot_funnel["records"].shift()).replace([np.inf, -np.inf], np.nan)
+display(snapshot_funnel)
+print("Solid curves exclude invalid spreads and peer flags; dotted raw medians retain zero spikes.")
+print("Not peer-flagged does not imply validated: inspect peer_assessed_fraction.")
 
 # %% [markdown]
 # ## Pair bid/ask within a dealer before using a midpoint
 # Spread width = bid spread minus ask spread. Only fresh pairs with close
-# timestamps and equal positive quantity (or both quantity missing) qualify.
+# timestamps qualify. Known quantities must match; unknown-size pairs are
+# explicitly unverified and allowed by PAIR_ALLOW_UNKNOWN_SIZE.
 # Crossed eligible pairs stay in the audit; they do not produce a usable midpoint.
 # Missing quantity on both sides means size is unknown, not verified equal.
 
@@ -249,29 +307,52 @@ ask = active.loc[active["side"].eq("ask"), pair_fields]
 pairs = bid.merge(ask, on=["time", "cusip", "firm"], suffixes=("_bid", "_ask"))
 pairs["time_gap_min"] = (pairs["event_time_bid"] - pairs["event_time_ask"]).abs().dt.total_seconds() / 60
 pairs["both_sizes_unknown"] = pairs["quantity_bid"].isna() & pairs["quantity_ask"].isna()
-pairs["same_size"] = (pairs["quantity_bid"].eq(pairs["quantity_ask"])
-                       & pairs["quantity_bid"].gt(0)) | pairs["both_sizes_unknown"]
-pairs["eligible"] = pairs["same_size"] & pairs["time_gap_min"].le(pd.Timedelta(C["PAIR_MAX_GAP"]).total_seconds() / 60)
+pairs["unknown_size"] = pairs["quantity_bid"].isna() | pairs["quantity_ask"].isna()
+pairs["known_same_size"] = pairs["quantity_bid"].gt(0) & pairs["quantity_ask"].gt(0) & pairs["quantity_bid"].eq(pairs["quantity_ask"])
+pairs["invalid_size"] = (pairs["quantity_bid"].le(0) | pairs["quantity_ask"].le(0))
+pairs["size_status"] = np.select(
+    [pairs["invalid_size"], pairs["both_sizes_unknown"], pairs["unknown_size"], pairs["known_same_size"]],
+    ["invalid_nonpositive", "unknown_both", "unknown_one", "known_same"], default="known_mismatch")
+pairs["time_compatible"] = pairs["time_gap_min"].le(pd.Timedelta(C["PAIR_MAX_GAP"]).total_seconds() / 60)
+pairs["eligible_known_size"] = pairs["time_compatible"] & pairs["known_same_size"]
+pairs["eligible_unknown_size"] = pairs["time_compatible"] & pairs["unknown_size"] & ~pairs["invalid_size"] & C["PAIR_ALLOW_UNKNOWN_SIZE"]
+pairs["eligible"] = pairs["eligible_known_size"] | pairs["eligible_unknown_size"]
 pairs["width_bps"] = pairs["spread_bid"] - pairs["spread_ask"]
 pairs["crossed"] = pairs["eligible"] & pairs["width_bps"].lt(0)
+pairs["peer_clean"] = pairs["peer_flag_bid"].eq(False) & pairs["peer_flag_ask"].eq(False)
 pairs["raw_mid"] = (pairs["spread_bid"] + pairs["spread_ask"]) / 2
-pairs["mid"] = pairs["raw_mid"].where(pairs["eligible"] & ~pairs["crossed"])
+pairs["mid"] = pairs["raw_mid"].where(pairs["eligible"] & ~pairs["crossed"] & pairs["peer_clean"])
+pairs["mid_known_size"] = pairs["mid"].where(pairs["eligible_known_size"])
+pairs["mid_unknown_size"] = pairs["mid"].where(pairs["eligible_unknown_size"])
 pair_stats = pairs.loc[pairs["eligible"]].groupby(["time", "cusip"]).agg(
     paired_dealers=("firm", "nunique"), crossed_fraction=("crossed", "mean"),
     width_bps=("width_bps", "median"), mid=("mid", "median"))
 for side in ["bid", "ask"]:
-    counts = active.loc[active["side"].eq(side)].groupby(["time", "cusip"])["firm"].nunique()
+    raw_counts = active_raw.loc[active_raw["side"].eq(side)].groupby(["time", "cusip"])["firm"].nunique()
+    coverage[f"{side}_raw_fresh_fraction"] = raw_counts.gt(0).groupby(level="cusip").sum().reindex(coverage.index, fill_value=0) / len(grid)
+    counts = clean_active.loc[clean_active["side"].eq(side)].groupby(["time", "cusip"])["firm"].nunique()
     coverage[f"{side}_fresh_fraction"] = counts.gt(0).groupby(level="cusip").sum().reindex(coverage.index, fill_value=0) / len(grid)
     coverage[f"{side}_2dealer_fraction"] = counts.ge(2).groupby(level="cusip").sum().reindex(coverage.index, fill_value=0) / len(grid)
 mid_counts = pairs.loc[pairs["mid"].notna()].groupby(["time", "cusip"])["firm"].nunique()
 coverage["paired_mid_fraction"] = mid_counts.gt(0).groupby(level="cusip").sum().reindex(coverage.index, fill_value=0) / len(grid)
 quality_summary = pd.Series({
-    "fresh_records": len(active), "peer_flag_fraction": active["peer_flag"].mean(),
+    "raw_fresh_records": len(active_raw), "valid_spread_records": len(active),
+    "clean_records": len(clean_active), "peer_flag_fraction": active["peer_flag"].mean(),
+    "peer_assessed_fraction": active["peer_assessed"].mean(),
     "both_sides_present_pairs": len(pairs), "eligible_pairs": pairs["eligible"].sum(),
     "crossed_eligible_fraction": pairs.loc[pairs["eligible"], "crossed"].mean(),
-    "eligible_size_unknown_fraction": pairs.loc[pairs["eligible"], "both_sizes_unknown"].mean(),
+    "eligible_known_size_pairs": pairs["eligible_known_size"].sum(),
+    "eligible_unknown_size_pairs": pairs["eligible_unknown_size"].sum(),
+    "eligible_size_unknown_fraction": pairs.loc[pairs["eligible"], "unknown_size"].mean(),
 }, name="value")
+pair_funnel = pd.Series({"both valid-spread sides present": len(pairs),
+                         "timestamps compatible": int(pairs["time_compatible"].sum()),
+                         "eligible, including unverified size": int(pairs["eligible"].sum()),
+                         "eligible noncrossed": int((pairs["eligible"] & ~pairs["crossed"]).sum()),
+                         "after peer filter, usable midpoint": int(pairs["mid"].notna().sum())}, name="pairs").to_frame()
 display(quality_summary.to_frame())
+display(pair_funnel)
+display(pairs.groupby("size_status").agg(pairs=("firm", "size"), eligible=("eligible", "sum")))
 display(coverage.sort_values(["window_trades", "bid_fresh_fraction"], ascending=[True, False]))
 # Directly inspect anomalies; never silently blank crossed medians.
 display(pairs.loc[pairs["crossed"]].head(20))
@@ -280,8 +361,9 @@ display(pairs.loc[pairs["crossed"]].head(20))
 # ## Bond explorer: liquid versus sparse, ordered by tenor
 # Each tenor band compares the most traded bond with a different sparsely traded
 # bond having quote coverage. No minimum trade count. Grey triangles are thinned
-# raw messages; lines and IQRs use equal-dealer latest states. Orange crosses
-# flag peer anomalies. Gaps in lines mean the quote coverage expired.
+# raw messages; solid lines/IQRs use valid, peer-filtered equal-dealer states.
+# Dotted lines retain raw fresh-state medians, including zero. Orange crosses
+# flag peer anomalies and excluded zero states. Gaps mean no usable coverage.
 
 # %% 6. Multi-bond quote/trade explorer
 pool = coverage.loc[coverage["window_quotes"].gt(0) & coverage["tenor"].notna()].copy()
@@ -321,7 +403,12 @@ if n_rows:
                                     fill="tonexty", fillcolor=fill[side], name=f"{side} dealer IQR",
                                     legendgroup=side, showlegend=panel == 0, connectgaps=False), row=row, col=col)
             fig.add_trace(go.Scatter(x=x, y=ss["median"], mode="lines", line_color=color[side],
-                                    name=f"{side} equal-dealer median", legendgroup=side,
+                                    name=f"{side} clean median", legendgroup=side,
+                                    showlegend=panel == 0, connectgaps=False), row=row, col=col)
+            raw_ss = raw_side_stats.reset_index().query("cusip == @cusip and side == @side").set_index("time").reindex(full_grid)
+            fig.add_trace(go.Scatter(x=x, y=raw_ss["median"], mode="lines",
+                                    line=dict(color=color[side], dash="dot", width=1), opacity=.35,
+                                    name=f"{side} raw median", legendgroup=f"raw {side}",
                                     showlegend=panel == 0, connectgaps=False), row=row, col=col)
         raw_all = window_q.loc[window_q["cusip"].eq(cusip) & window_q["spread"].notna()].copy()
         raw_all["plot_bin"] = raw_all["known_time"].dt.floor("15min")
@@ -341,17 +428,21 @@ if n_rows:
         fig.add_trace(go.Scattergl(
             x=raw["known_time"].dt.tz_localize(None), y=raw["spread"], mode="markers",
             marker=dict(size=4, color="rgba(100,105,115,.4)", symbol=np.where(raw["side"].eq("bid"), "triangle-up", "triangle-down")),
-            customdata=raw[["firm", "side", "quantity"]].to_numpy(),
+            customdata=raw[["firm", "side", "quantity_raw"]].to_numpy(),
             hovertemplate="%{x}<br>%{y:.2f} bps<br>%{customdata[0]} %{customdata[1]}<br>quantity=%{customdata[2]}<extra></extra>",
             name="raw dealer messages", showlegend=panel == 0), row=row, col=col)
-        bad = active.loc[active["cusip"].eq(cusip) & active["peer_flag"]].iloc[::max(1, int(len(active) / 200000))]
+        bad = pd.concat([active.loc[active["cusip"].eq(cusip) & active["peer_flag"]],
+                         active_raw.loc[active_raw["cusip"].eq(cusip) & ~active_raw["spread_valid"]]], ignore_index=True)
+        if len(bad) > C["MAX_RAW_MARKERS"]:
+            bad = bad.iloc[np.linspace(0, len(bad) - 1, C["MAX_RAW_MARKERS"]).astype(int)]
         fig.add_trace(go.Scattergl(x=bad["time"].dt.tz_localize(None), y=bad["spread"], mode="markers",
-                                  marker=dict(size=6, symbol="x", color="#d59615"), name="peer flag (retained)",
+                                  marker=dict(size=6, symbol="x", color="#d59615"), name="excluded anomaly (raw)",
                                   showlegend=panel == 0), row=row, col=col)
         tr = it.loc[it["cusip"].eq(cusip)]
         for trade_type, trade_color in {"B": "#238b45", "S": "#c62828", "D": "#4f70a0", "?": "#777777"}.items():
             tt = tr.loc[tr["type"].eq(trade_type)]
-            size = 5 + 12 * np.sqrt(tt["quantity"].fillna(0).clip(0, 5000000) / 5000000)
+            size_scale = max(1e-12, tt["quantity"].clip(lower=0).quantile(.95))
+            size = 5 + 12 * np.sqrt(tt["quantity"].fillna(0).clip(0, size_scale) / size_scale)
             fig.add_trace(go.Scattergl(x=tt["time"].dt.tz_localize(None), y=tt["spread"], mode="markers",
                                       marker=dict(size=size, color=trade_color, opacity=.8),
                                       customdata=tt[["quantity"]].to_numpy(),
@@ -360,8 +451,8 @@ if n_rows:
                                       showlegend=panel == 0), row=row, col=col)
     fig.update_xaxes(matches="x", title_text="ET")
     fig.update_yaxes(title_text="Spread (bps)")
-    fig.update_layout(title=f"{issuer}: latest dealer quotes and trades", height=300 * n_rows + 120,
-                      template="plotly_white", legend=dict(orientation="h", y=1.08))
+    fig.update_layout(title=dict(text=f"{issuer}: latest dealer quotes and trades", y=.99), height=300 * n_rows + 180,
+                      template="plotly_white", margin=dict(t=160), legend=dict(orientation="h", y=1.13))
     figures["bond_explorer"] = fig
     if C["SHOW_PLOTS"]:
         fig.show()
@@ -377,24 +468,26 @@ if n_rows:
 events = iq.loc[iq["known_time"].between(start, end)]
 dealer_stats = events.groupby("firm").agg(
     events=("spread", "size"), median_gap_min=("gap_min", "median"),
-    changed_fraction=("value_changed", "mean"), median_quantity=("quantity", "median"))
+    changed_fraction=("value_changed", "mean"), spread_changed_fraction=("spread_changed", "mean"),
+    median_quantity=("quantity", "median"))
 dealer_stats = dealer_stats.reindex(pd.Index(sorted(set(events["firm"]) | set(active["firm"])), name="firm"))
 dealer_stats["events"] = dealer_stats["events"].fillna(0)
 dealer_stats["event_share"] = dealer_stats["events"] / max(1, dealer_stats["events"].sum())
 dealer_stats["fresh_slot_share"] = active.groupby("firm").size().reindex(dealer_stats.index, fill_value=0) / max(1, len(active))
 dealer_stats["peer_flag_fraction"] = active.groupby("firm")["peer_flag"].mean()
+dealer_stats["peer_assessed_fraction"] = active.groupby("firm")["peer_assessed"].mean()
 dealer_stats["median_peer_residual_bps"] = active.groupby("firm")["peer_residual"].median()
 dealer_stats["missing_quantity_fraction"] = events["quantity"].isna().groupby(events["firm"]).mean()
 dealer_stats = dealer_stats.sort_values("events", ascending=False)
 display(dealer_stats)
 fig = make_subplots(rows=2, cols=2, subplot_titles=[
-    "Update share versus fresh dealer-slot share", "Message age versus value-change age (fresh records)",
+    "Update share versus fresh dealer-slot share", "Message age versus spread-change age (valid records)",
     "Dealer residual to same-side peer median", "Peer residual versus quote size (descriptive)"])
 top = dealer_stats.head(15)
 for column, label in [("event_share", "message share"), ("fresh_slot_share", "fresh-slot share")]:
     fig.add_trace(go.Bar(x=top.index, y=top[column], name=label), row=1, col=1)
 bins = np.linspace(0, 120, 25)
-for column, label in [("age_min", "message age"), ("value_age_min", "value-change age")]:
+for column, label in [("age_min", "message age"), ("spread_age_min", "spread-change age")]:
     count, edges = np.histogram(active[column].clip(upper=119.99).dropna(), bins=bins)
     fig.add_trace(go.Bar(x=(edges[:-1] + edges[1:]) / 2, y=count / max(1, count.sum()), name=label), row=1, col=2)
 fig.add_trace(go.Bar(x=top.index, y=top["median_peer_residual_bps"], name="dealer residual"), row=2, col=1)
@@ -408,7 +501,7 @@ if len(size_residuals):
         fig.add_trace(go.Scatter(x=sub["quantity"], y=sub["residual"], mode="lines+markers",
                                 customdata=sub[["n"]].to_numpy(), name=f"size residual {side}"), row=2, col=2)
 fig.update_xaxes(title_text="minutes; last bin includes >=120", row=1, col=2)
-fig.update_xaxes(type="log", title_text="quoted quantity", row=2, col=2)
+fig.update_xaxes(type="log", title_text="quoted quantity (source units)", row=2, col=2)
 fig.update_yaxes(title_text="bps", row=2)
 fig.update_layout(title=f"{issuer}: dealer and refresh diagnostics", height=750, template="plotly_white", barmode="group")
 figures["dealer_diagnostics"] = fig
@@ -431,7 +524,7 @@ cross_time = eligible.groupby("time")["crossed"].mean().reindex(full_grid)
 fig.add_trace(go.Scatter(x=full_grid.tz_localize(None), y=width_time, mode="lines", name="median signed width", connectgaps=False), row=1, col=1)
 fig.add_trace(go.Scatter(x=full_grid.tz_localize(None), y=cross_time, mode="lines", name="crossed fraction", connectgaps=False), row=1, col=2)
 for side in ["bid", "ask"]:
-    counts = active.loc[active["side"].eq(side)].groupby(["time", "cusip"])["firm"].nunique()
+    counts = clean_active.loc[clean_active["side"].eq(side)].groupby(["time", "cusip"])["firm"].nunique()
     n_bonds = counts.ge(2).groupby(level="time").sum().reindex(grid, fill_value=0).reindex(full_grid)
     fig.add_trace(go.Scatter(x=full_grid.tz_localize(None), y=n_bonds, mode="lines", name=f"covered bonds {side}", connectgaps=False), row=2, col=1)
 fig.add_trace(go.Scatter(
@@ -450,10 +543,11 @@ if C["SHOW_PLOTS"]:
     fig.show()
 
 # %% [markdown]
-# ## Issuer co-movement: changes with matched dealers and stable size
+# ## Issuer co-movement: matched dealers, with size sensitivity checks
 # At t and t-lag, match the same bond / firm / side. Require freshness at both
-# ends, stay within the same ET session day, and require unchanged positive size
-# or size missing at both ends. Then take the median dealer change per bond.
+# ends and stay within the same ET session day. Remove peer flags at either end,
+# then take the median dealer change per bond, without requiring size equality.
+# Report known-equal-size and unknown-size subsets as separate sensitivity checks.
 # This removes shifts caused solely by dealers entering/leaving the sample.
 # Report overlap counts beside correlations; avoid interpreting level correlations.
 # PCA uses complete rows for a small covered subset; no zero-fill or forward-fill.
@@ -465,31 +559,54 @@ fields = ["time", "cusip", "firm", "side", "spread", "quantity", "peer_flag"]
 old = active[fields].copy()
 old["time"] += lag
 matched = active[fields].merge(old, on=["time", "cusip", "firm", "side"], suffixes=("", "_old"))
+matched_both_ends = len(matched)
 matched = matched.loc[matched["time"].dt.normalize().eq((matched["time"] - lag).dt.normalize())].copy()
-matched["same_size"] = ((matched["quantity"].eq(matched["quantity_old"]) & matched["quantity"].gt(0))
-                        | (matched["quantity"].isna() & matched["quantity_old"].isna()))
+matched["known_same_size"] = matched["quantity"].gt(0) & matched["quantity_old"].gt(0) & matched["quantity"].eq(matched["quantity_old"])
+matched["unknown_size"] = matched["quantity"].isna() | matched["quantity_old"].isna()
+matched["known_size_changed"] = matched["quantity"].gt(0) & matched["quantity_old"].gt(0) & ~matched["known_same_size"]
 matched["change_bps"] = matched["spread"] - matched["spread_old"]
-movement = matched.groupby(gkey).agg(change_all_sizes=("change_bps", "median"), n_all=("firm", "nunique"))
-stable = matched.loc[matched["same_size"]]
-stable_stats = stable.groupby(gkey).agg(change_bps=("change_bps", "median"), n_matched=("firm", "nunique"))
-movement = movement.join(stable_stats)
-clean = stable.loc[~stable["peer_flag"] & ~stable["peer_flag_old"]].groupby(gkey).agg(
-    change_without_flags=("change_bps", "median"), n_without_flags=("firm", "nunique"))
-movement = movement.join(clean)
-movement["change_bps"] = movement["change_bps"].where(movement["n_matched"].ge(C["MIN_MATCHED_DEALERS"]))
-movement["change_without_flags"] = movement["change_without_flags"].where(movement["n_without_flags"].ge(C["MIN_MATCHED_DEALERS"]))
+matched_clean = matched.loc[matched["peer_flag"].eq(False) & matched["peer_flag_old"].eq(False)].copy()
+movement = matched.groupby(gkey).agg(change_before_peer_filter=("change_bps", "median"), n_before_peer_filter=("firm", "nunique"))
+movement = movement.join(matched_clean.groupby(gkey).agg(change_bps=("change_bps", "median"), n_matched=("firm", "nunique")))
+stable = matched_clean.loc[matched_clean["known_same_size"]]
+unknown = matched_clean.loc[matched_clean["unknown_size"]]
+movement = movement.join(stable.groupby(gkey).agg(change_stable_size=("change_bps", "median"), n_stable_size=("firm", "nunique")))
+movement = movement.join(unknown.groupby(gkey).agg(change_unknown_size=("change_bps", "median"), n_unknown_size=("firm", "nunique")))
+for value, count in [("change_bps", "n_matched"), ("change_before_peer_filter", "n_before_peer_filter"),
+                     ("change_stable_size", "n_stable_size"), ("change_unknown_size", "n_unknown_size")]:
+    movement[value] = movement[value].where(movement[count].ge(C["MIN_MATCHED_DEALERS"]))
+supported = matched_clean.loc[matched_clean.groupby(gkey)["firm"].transform("nunique").ge(C["MIN_MATCHED_DEALERS"])]
+movement_funnel = pd.DataFrame([
+    {"stage": label, "dealer_pairs": len(frame), "bond_side_snapshots": frame[gkey].drop_duplicates().shape[0]}
+    for label, frame in [("matched, same session day", matched), ("main: after peer filter, all sizes", matched_clean),
+                          ("main: minimum matched dealers", supported),
+                          ("sensitivity: known stable size", stable), ("sensitivity: unknown size", unknown)]
+]).set_index("stage")
+print(f"Matched endpoints before same-day restriction: {matched_both_ends:,} dealer pairs.")
+display(movement_funnel)
 chosen = movement.reset_index().loc[lambda x: x["side"].eq(C["ANALYSIS_SIDE"])]
-changes = chosen.pivot(index="time", columns="cusip", values="change_bps").reindex(grid)
-changes_clean = chosen.pivot(index="time", columns="cusip", values="change_without_flags").reindex(grid)
-ordered = coverage.sort_values("tenor", na_position="last").index.intersection(changes.columns, sort=False)
-changes = changes.reindex(columns=ordered)
-changes_clean = changes_clean.reindex(columns=ordered)
+change_views = {}
+for name, value in [("main", "change_bps"), ("before_peer_filter", "change_before_peer_filter"),
+                     ("stable_size", "change_stable_size"), ("unknown_size", "change_unknown_size")]:
+    change_views[name] = chosen.pivot(index="time", columns="cusip", values=value).reindex(grid)
+ordered = coverage.sort_values("tenor", na_position="last").index.intersection(change_views["main"].columns, sort=False)
+change_views = {name: frame.reindex(columns=ordered) for name, frame in change_views.items()}
+changes = change_views["main"]
+changes_stable_size = change_views["stable_size"]
+changes_unknown_size = change_views["unknown_size"]
+comovement_coverage = pd.DataFrame({"main_observations": changes.count(),
+    "stable_size_observations": changes_stable_size.count(), "unknown_size_observations": changes_unknown_size.count(),
+    "nonzero_main_changes": (changes.abs().gt(1e-10) & changes.notna()).sum(), "std_bps": changes.std()})
+display(comovement_coverage)
 observed = changes.notna().astype("int64")
 overlap = observed.T @ observed
 correlation = changes.corr(min_periods=C["MIN_COMMON_OBS"])
-correlation_without_flags = changes_clean.corr(min_periods=C["MIN_COMMON_OBS"])
+correlation_before_peer_filter = change_views["before_peer_filter"].corr(min_periods=C["MIN_COMMON_OBS"])
+correlation_stable_size = changes_stable_size.corr(min_periods=C["MIN_COMMON_OBS"])
+correlation_unknown_size = changes_unknown_size.corr(min_periods=C["MIN_COMMON_OBS"])
 display(overlap)
-display(correlation_without_flags)
+display(correlation)
+print("Compare correlation_stable_size / correlation_unknown_size / correlation_before_peer_filter separately.")
 pca_columns = changes.count().sort_values(ascending=False).loc[lambda x: x.ge(C["MIN_COMMON_OBS"])].head(6).index
 complete = changes[pca_columns].dropna()
 complete = complete.loc[:, complete.std(ddof=0).gt(0)]
@@ -502,7 +619,7 @@ if len(complete) >= C["MIN_COMMON_OBS"] and complete.shape[1] >= 3:
     print(f"PCA: {len(complete)} complete snapshots, {complete.shape[1]} bonds: {list(complete.columns)}")
     display(pca_variance.to_frame())
 else:
-    print("PCA skipped: need >=3 nonconstant bonds and enough complete matched-change rows.")
+    print(f"PCA skipped: {len(complete)} complete rows, {complete.shape[1]} nonconstant bonds; need >=3 bonds and >={C['MIN_COMMON_OBS']} rows.")
 fig = make_subplots(rows=2, cols=2, subplot_titles=[
     f"Matched-dealer {C['CHANGE_LAG']} {C['ANALYSIS_SIDE']} changes (bps)", "Pairwise change correlation",
     "Number of shared observations", "PCA on complete standardized changes (subset)"])
@@ -529,6 +646,7 @@ if C["SHOW_PLOTS"]:
 # * Do results persist at MAX_AGE=10/30/60min and CHANGE_LAG=15/30/60min?
 # * Are similar moves independent dealer evidence or a single dealer's batch refresh?
 # * Do unknown/mismatched sizes or asynchronously updated sides dominate?
-# Inspect `coverage`, `dealer_stats`, `pairs`, `active`, `movement`, and `overlap`.
+# Inspect `snapshot_funnel`, `pair_funnel`, `movement_funnel`, `comovement_coverage`,
+# plus `coverage`, `dealer_stats`, `pairs`, `active_raw`, `clean_active`, and `overlap`.
 # Good co-movement is evidence to prototype an online issuer state, not proof of
 # predictive value. That requires a later chronological downstream evaluation.

@@ -102,8 +102,10 @@ class QuoteEDAChecks(unittest.TestCase):
         new["quote_timestamp_ET"] = pd.date_range("2026-03-02 10:00:01", periods=200, freq="s")
         result = replay(pd.concat([q, new], ignore_index=True), t, m)
         stat = result["side_stats"].loc[(pd.Timestamp("2026-03-02 10:05", tz="America/New_York"), "BOND00001", "bid")]
-        self.assertEqual(stat["n_dealers"], 3)
-        self.assertEqual(stat["median"], 64)
+        self.assertEqual(stat["n_before_peer_filter"], 3)
+        self.assertEqual(stat["median_before_peer_filter"], 64)
+        self.assertEqual(stat["n_dealers"], 2)
+        self.assertEqual(stat["median"], 63)
         self.assertEqual(len(snapshot(result, "2026-03-02 10:05", active=True)), 1)
         self.assertTrue(snapshot(result, "2026-03-02 10:05", active=True)["peer_flag"].iloc[0])
 
@@ -147,6 +149,7 @@ class QuoteEDAChecks(unittest.TestCase):
         q["spread"] = q["firm"].map({"A": 60., "B": 61., "C": 90.})
         q = q.loc[~(q["firm"].eq("C") & q["quote_timestamp_ET"].lt(pd.Timestamp("2026-03-02 10:25")))]
         result = replay(q, t, m)
+        self.assertEqual(result["states"]["spread_valid"].dtype, bool)
         self.assertTrue(result["changes"].stack().eq(0).all())
         self.assertTrue(result["overlap"].to_numpy().max() > 0)
         self.assertEqual(len(result["pca_variance"]), 0)
@@ -159,6 +162,88 @@ class QuoteEDAChecks(unittest.TestCase):
         self.assertTrue(result["coverage"]["ask_fresh_fraction"].eq(0).all())
         self.assertTrue(result["coverage"]["paired_mid_fraction"].eq(0).all())
         self.assertTrue(result["changes"].count().gt(0).all())
+
+    def test_zero_quantity_sentinels_preserve_comovement(self):
+        q, t, m = fixture()
+        minutes = (q["quote_timestamp_ET"] - q["quote_timestamp_ET"].min()).dt.total_seconds() / 60
+        q["spread"] += .005 * minutes ** 2  # nonconstant aligned changes
+        q["quantity"] = 0.
+        result = replay(q, t, m)
+        self.assertTrue(result["q"]["quantity_raw"].eq(0).all())
+        self.assertTrue(result["q"]["quantity"].isna().all())
+        self.assertTrue(result["pairs"]["eligible_unknown_size"].all())
+        self.assertFalse(result["pairs"]["known_same_size"].any())
+        self.assertTrue(result["changes"].count().ge(3).all())
+        self.assertTrue(result["changes_stable_size"].isna().all().all())
+        self.assertTrue(result["changes_unknown_size"].notna().any().all())
+        self.assertAlmostEqual(result["correlation"].iloc[0, 1], 1.)
+        self.assertGreater(len(result["pca_variance"]), 0)
+
+    def test_unknown_size_on_one_side_is_explicitly_unverified(self):
+        q, t, m = fixture()
+        q.loc[q["side"].eq("ask"), "quantity"] = 0
+        result = replay(q, t, m)
+        self.assertTrue(result["pairs"]["size_status"].eq("unknown_one").all())
+        self.assertTrue(result["pairs"]["eligible_unknown_size"].all())
+        self.assertFalse(result["pairs"]["eligible_known_size"].any())
+        strict = replay(q, t, m, PAIR_ALLOW_UNKNOWN_SIZE=False)
+        self.assertFalse(strict["pairs"]["eligible"].any())
+
+    def test_zero_spread_latest_does_not_revive_old_quote(self):
+        q, t, m = fixture()
+        q = q.loc[q["firm"].eq("A") & q["side"].eq("bid")].copy()
+        target = q["cusip"].eq("BOND00001")
+        row = q.loc[target].iloc[0].copy()
+        row["quote_timestamp_ET"] = pd.Timestamp("2026-03-02 10:06")
+        row["spread"] = 0.
+        q = q.loc[~(target & q["quote_timestamp_ET"].ge(pd.Timestamp("2026-03-02 10:06")))]
+        q = pd.concat([q, row.to_frame().T], ignore_index=True)
+        result = replay(q, t, m)
+        latest = snapshot(result, "2026-03-02 10:10").iloc[0]
+        self.assertEqual(latest["spread"], 0)
+        self.assertTrue(latest["fresh"])
+        self.assertFalse(latest["usable"])
+        self.assertEqual(len(snapshot(result, "2026-03-02 10:10", active=True)), 0)
+        when = pd.Timestamp("2026-03-02 10:10", tz="America/New_York")
+        self.assertEqual(result["raw_side_stats"].loc[(when, "BOND00001", "bid"), "median"], 0)
+        self.assertNotIn((when, "BOND00001", "bid"), result["side_stats"].index)
+        valid_zero = replay(q, t, m, ZERO_SPREAD_IS_MISSING=False)
+        self.assertEqual(len(snapshot(valid_zero, "2026-03-02 10:10", active=True)), 1)
+
+    def test_size_changes_are_sensitivity_not_main_filter(self):
+        q, t, m = fixture()
+        minutes = (q["quote_timestamp_ET"] - q["quote_timestamp_ET"].min()).dt.total_seconds() / 60
+        q["quantity"] = 1000000 + minutes * 1000
+        result = replay(q, t, m)
+        self.assertTrue(result["changes"].count().gt(0).all())
+        self.assertTrue(result["matched_clean"]["known_size_changed"].all())
+        self.assertTrue(result["changes_stable_size"].isna().all().all())
+        self.assertTrue(result["changes_unknown_size"].isna().all().all())
+
+    def test_quote_metadata_preserves_bonds_absent_from_trades(self):
+        q, t, m = fixture()
+        q["ISSUER"] = "TEST"
+        q["YRS_TO_MATURITY"] = q["cusip"].map(m.set_index("CUSIP")["YRS_TO_MATURITY"])
+        t = pd.DataFrame({"CUSIP": ["BOND00001"], "EFFECTIVE_DATETIME_TS": [pd.Timestamp("2026-03-02 10:05")],
+                          "BM_SPREAD": [.63], "QUANTITY": [1000000], "EFF_SIDE": ["B"]})
+        result = replay(q, t, None)
+        self.assertEqual(len(result["analysis_cusips"]), 3)
+        self.assertEqual(result["coverage"].loc["BOND00002", "window_trades"], 0)
+        self.assertGreater(result["coverage"].loc["BOND00002", "bid_fresh_fraction"], 0)
+        self.assertEqual(len(result["unmapped_quote_cusips"]), 0)
+
+    def test_timestamp_sequence_resolves_conflicts(self):
+        q, t, m = fixture()
+        q["feed_sequence"] = 10
+        row = q.loc[q["cusip"].eq("BOND00001") & q["firm"].eq("A") & q["side"].eq("bid")
+                    & q["quote_timestamp_ET"].eq(pd.Timestamp("2026-03-02 10:00"))].iloc[0].copy()
+        high, low = row.copy(), row.copy()
+        high["feed_sequence"], high["spread"] = 100, 70.
+        low["feed_sequence"], low["spread"] = 1, 60.
+        q = pd.concat([q, high.to_frame().T, low.to_frame().T], ignore_index=True)
+        result = replay(q, t, m, QUOTE_SEQUENCE_COL="feed_sequence")
+        self.assertEqual(snapshot(result, "2026-03-02 10:05").iloc[0]["spread"], 70)
+        self.assertGreater(result["audit"]["conflicting_timestamp_groups"], 0)
 
 
 if __name__ == "__main__":

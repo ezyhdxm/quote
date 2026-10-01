@@ -20,7 +20,7 @@ def make_demo(seed=7):
             selected = np.arange(len(times))[::[1, 2, 3, 4][d]]
             if i == 1 and d > 0:
                 selected = selected[::3]
-            quantity = [1000000, 1000000, 500000, None][d]
+            quantity = [1.0, 1.0, .5, 0.0][d]  # source units; zero-coded missing size
             for j in selected:
                 noise = rng.normal(0, .3)
                 for side, width in [("bid", 2.0), ("ask", -2.0)]:
@@ -38,7 +38,7 @@ def make_demo(seed=7):
             side = rng.choice(["B", "S", "D"])
             spread = level[j] + {"B": 1.5, "S": -1.5, "D": 0}[side] + rng.normal(0, .7)
             trades.append((cusip, times[j].tz_localize(None), spread / 100,
-                           rng.choice([100000, 500000, 1000000, 3000000]), side,
+                           rng.choice([.1, .5, 1., 3.]), side,
                            "Demo Issuer", metadata.loc[i, "YRS_TO_MATURITY"]))
     q = pd.DataFrame(quotes, columns=["cusip", "firm", "side", "quote_timestamp_ET", "spread", "quantity"])
     q = pd.concat([q, q.iloc[:10]], ignore_index=True)  # exact duplicate examples
