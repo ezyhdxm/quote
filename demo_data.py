@@ -15,6 +15,8 @@ def make_demo(seed=7):
     quotes, trades = [], []
     for i, cusip in enumerate(cusips):
         level = 45 + 3 * metadata.loc[i, "YRS_TO_MATURITY"] + common
+        if i == 0:
+            level = 1. + common  # a coherent near-zero/negative-spread bond
         for d, firm in enumerate(["Dealer A", "Dealer B", "Dealer C", "Dealer D"]):
             # One dealer refreshes much more often; its feed share should not be its weight.
             selected = np.arange(len(times))[::[1, 2, 3, 4][d]]
@@ -32,8 +34,12 @@ def make_demo(seed=7):
                     if i == 3 and firm == "Dealer C" and side == "ask" and j % 73 == 0:
                         value += 15.0  # eligible crossed pair
                     quotes.append((cusip, firm, side, times[j].tz_localize(None), value, quantity))
-        # Bond 1 is quote-only. Odd bonds are much less traded than their tenor neighbor.
+        # Bond 1 traded in the three-month universe, but not in the short quote window.
+        # Odd bonds are much less traded than their tenor neighbor.
         count = 0 if i == 1 else (15 if i % 2 else 160)
+        if i == 1:
+            trades.append((cusip, pd.Timestamp("2026-01-15 10:00"), level[0] / 100,
+                           1., "D", "Demo Issuer", metadata.loc[i, "YRS_TO_MATURITY"]))
         for j in sorted(rng.choice(len(times), size=count, replace=False)):
             side = rng.choice(["B", "S", "D"])
             spread = level[j] + {"B": 1.5, "S": -1.5, "D": 0}[side] + rng.normal(0, .7)

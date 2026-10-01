@@ -24,7 +24,9 @@ def fixture():
                 for side, offset in [("bid", 2), ("ask", -2)]:
                     rows.append((cusip, firm, side, when, 60 + i * 10 + j + offset, 1000000))
     q = pd.DataFrame(rows, columns=["cusip", "firm", "side", "quote_timestamp_ET", "spread", "quantity"])
-    t = pd.DataFrame(columns=["CUSIP", "EFFECTIVE_DATETIME_TS", "BM_SPREAD", "QUANTITY", "EFF_SIDE"])
+    t = pd.DataFrame({"CUSIP": ["BOND00001", "BOND00002", "BOND00003"],
+                      "EFFECTIVE_DATETIME_TS": pd.to_datetime(["2026-02-02 10:00"] * 3),
+                      "BM_SPREAD": [.6, .7, .8], "QUANTITY": 1000000, "EFF_SIDE": "D"})
     m = pd.DataFrame({"CUSIP": ["BOND00001", "BOND00002", "BOND00003"],
                       "ISSUER": "TEST", "YRS_TO_MATURITY": [1., 5., 10.]})
     return q, t, m
@@ -46,13 +48,56 @@ def snapshot(result, when, cusip="BOND00001", firm="A", side="bid", active=False
 
 
 class QuoteEDAChecks(unittest.TestCase):
-    def test_strict_causality_and_quote_only_coverage(self):
+    def test_trade_universe_is_independent_of_short_quote_window(self):
+        q, t, m = fixture()
+        extra = q.loc[q["cusip"].eq("BOND00001")].assign(cusip="NEVERTRADE")
+        q = pd.concat([q, extra], ignore_index=True)
+        m = pd.concat([m, pd.DataFrame({"CUSIP": ["NEVERTRADE"], "ISSUER": ["TEST"],
+                                       "YRS_TO_MATURITY": [2.]})], ignore_index=True)
+        t.loc[t["CUSIP"].eq("BOND00003"), "EFFECTIVE_DATETIME_TS"] = pd.Timestamp("2025-11-30 10:00")
+        result = replay(q, t, m, TRADE_UNIVERSE_START="2025-12-01", TRADE_UNIVERSE_END="2026-03-01")
+        self.assertEqual(set(result["analysis_cusips"]), {"BOND00001", "BOND00002"})
+        self.assertEqual(set(result["q"]["cusip"]), {"BOND00001", "BOND00002"})
+        self.assertTrue(result["coverage"]["n_trades"].eq(1).all())
+        self.assertTrue(result["coverage"]["window_trades"].eq(0).all())
+        self.assertTrue(result["coverage"]["bid_fresh_fraction"].gt(0).all())
+        self.assertEqual(result["audit"]["quotes_outside_trade_universe"], len(extra) * 2)
+
+    def test_existing_trade_cusip_prefilter_is_supported(self):
+        q, t, m = fixture()
+        t = t.loc[t["CUSIP"].ne("BOND00003")]
+        full = replay(q, t, m)
+        prefiltered = replay(q.loc[q["cusip"].isin(t["CUSIP"])], t, m)
+        pd.testing.assert_frame_equal(full["side_stats"], prefiltered["side_stats"])
+        self.assertEqual(set(full["analysis_cusips"]), {"BOND00001", "BOND00002"})
+
+    def test_zero_and_negative_consensus_remain_valid_by_default(self):
+        q, t, m = fixture()
+        q["spread"] = (pd.Timestamp("2026-03-02 10:10") - q["quote_timestamp_ET"]).dt.total_seconds() / 300
+        result = replay(q, t, m, CHANGE_LAG="10min")
+        zero = snapshot(result, "2026-03-02 10:15", active=True).iloc[0]
+        negative = snapshot(result, "2026-03-02 10:20", active=True).iloc[0]
+        self.assertEqual(zero["spread"], 0.)
+        self.assertEqual(negative["spread"], -1.)
+        self.assertFalse(zero["peer_flag"])
+        self.assertFalse(negative["peer_flag"])
+        self.assertTrue(result["pairs"]["mid"].lt(0).any())
+        when = pd.Timestamp("2026-03-02 10:15", tz="America/New_York")
+        self.assertEqual(result["side_stats"].loc[(when, "BOND00001", "bid"), "median"], 0.)
+        self.assertTrue(result["matched_clean"]["spread"].eq(0).any())
+        self.assertTrue(result["matched_clean"]["spread_old"].eq(0).any())
+        self.assertFalse(result["nonzero"]["spread"].eq(0).any())
+        self.assertFalse(result["nonzero"]["spread_old"].eq(0).any())
+        self.assertTrue(result["nonzero"]["spread"].lt(0).any())
+        self.assertTrue((result["changes"].count() > result["changes_excluding_zero"].count()).all())
+
+    def test_strict_event_time_and_no_trade_in_quote_window(self):
         q, t, m = fixture()
         result = replay(q, t, m)
         state = snapshot(result, "2026-03-02 10:05").iloc[0]
-        self.assertEqual(state["known_time"], pd.Timestamp("2026-03-02 10:00", tz="America/New_York"))
+        self.assertEqual(state["event_time"], pd.Timestamp("2026-03-02 10:00", tz="America/New_York"))
         self.assertEqual(state["spread"], 63)
-        self.assertTrue((result["states"]["known_time"] < result["states"]["time"]).all())
+        self.assertTrue((result["states"]["event_time"] < result["states"]["time"]).all())
         self.assertTrue(result["coverage"]["window_trades"].eq(0).all())
         self.assertTrue(result["coverage"]["bid_2dealer_fraction"].gt(0).all())
 
@@ -124,16 +169,15 @@ class QuoteEDAChecks(unittest.TestCase):
         self.assertFalse(c["eligible"])
         self.assertEqual(len(result["active"].loc[lambda x: x["firm"].eq("A") & x["side"].eq("ask")]), 39)
 
-    def test_receipt_time_and_out_of_order_arrivals(self):
+    def test_replay_uses_event_time_and_sorts_input(self):
         q, t, m = fixture()
-        q["received_ET"] = q["quote_timestamp_ET"]
-        mask = (q["cusip"] == "BOND00001") & (q["firm"] == "A") & (q["side"] == "bid")
-        q.loc[mask & q["quote_timestamp_ET"].eq(pd.Timestamp("2026-03-02 10:00")), "received_ET"] = pd.Timestamp("2026-03-02 10:08")
-        # 10:05 is received at 10:05; the older 10:00 arrival at 10:08 must not overwrite it.
-        result = replay(q, t, m, QUOTE_AVAILABLE_COL="received_ET")
-        self.assertEqual(snapshot(result, "2026-03-02 10:05").iloc[0]["event_time"], pd.Timestamp("2026-03-02 09:55", tz="America/New_York"))
-        self.assertEqual(snapshot(result, "2026-03-02 10:10").iloc[0]["event_time"], pd.Timestamp("2026-03-02 10:05", tz="America/New_York"))
-        self.assertEqual(result["audit"]["out_of_order_messages"], 1)
+        baseline = replay(q, t, m)
+        q["received_ET"] = q["quote_timestamp_ET"] + pd.Timedelta("2h")
+        result = replay(q.sample(frac=1, random_state=3), t, m)
+        pd.testing.assert_frame_equal(baseline["side_stats"], result["side_stats"])
+        self.assertNotIn("known_time", result["q"].columns)
+        self.assertEqual(snapshot(result, "2026-03-02 10:05").iloc[0]["event_time"],
+                         pd.Timestamp("2026-03-02 10:00", tz="America/New_York"))
 
     def test_timezone_conversion_matches_naive_et(self):
         q, t, m = fixture()
@@ -198,7 +242,7 @@ class QuoteEDAChecks(unittest.TestCase):
         row["spread"] = 0.
         q = q.loc[~(target & q["quote_timestamp_ET"].ge(pd.Timestamp("2026-03-02 10:06")))]
         q = pd.concat([q, row.to_frame().T], ignore_index=True)
-        result = replay(q, t, m)
+        result = replay(q, t, m, ZERO_SPREAD_IS_MISSING=True)
         latest = snapshot(result, "2026-03-02 10:10").iloc[0]
         self.assertEqual(latest["spread"], 0)
         self.assertTrue(latest["fresh"])
@@ -207,7 +251,7 @@ class QuoteEDAChecks(unittest.TestCase):
         when = pd.Timestamp("2026-03-02 10:10", tz="America/New_York")
         self.assertEqual(result["raw_side_stats"].loc[(when, "BOND00001", "bid"), "median"], 0)
         self.assertNotIn((when, "BOND00001", "bid"), result["side_stats"].index)
-        valid_zero = replay(q, t, m, ZERO_SPREAD_IS_MISSING=False)
+        valid_zero = replay(q, t, m)
         self.assertEqual(len(snapshot(valid_zero, "2026-03-02 10:10", active=True)), 1)
 
     def test_size_changes_are_sensitivity_not_main_filter(self):
@@ -220,12 +264,10 @@ class QuoteEDAChecks(unittest.TestCase):
         self.assertTrue(result["changes_stable_size"].isna().all().all())
         self.assertTrue(result["changes_unknown_size"].isna().all().all())
 
-    def test_quote_metadata_preserves_bonds_absent_from_trades(self):
+    def test_quote_metadata_supports_traded_bonds_with_no_window_trades(self):
         q, t, m = fixture()
         q["ISSUER"] = "TEST"
         q["YRS_TO_MATURITY"] = q["cusip"].map(m.set_index("CUSIP")["YRS_TO_MATURITY"])
-        t = pd.DataFrame({"CUSIP": ["BOND00001"], "EFFECTIVE_DATETIME_TS": [pd.Timestamp("2026-03-02 10:05")],
-                          "BM_SPREAD": [.63], "QUANTITY": [1000000], "EFF_SIDE": ["B"]})
         result = replay(q, t, None)
         self.assertEqual(len(result["analysis_cusips"]), 3)
         self.assertEqual(result["coverage"].loc["BOND00002", "window_trades"], 0)
