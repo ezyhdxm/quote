@@ -1,3 +1,44 @@
+# Data quality research — step 1
+
+Open [quote_quality_step1.ipynb](quote_quality_step1.ipynb) and run its **three code cells**.
+The matching [quote_quality_step1.py](quote_quality_step1.py) has VS Code cells.
+Run from your existing project root containing `data/` and the local `data.py` loader.
+
+Cell 1 includes your photographed loading code and paths: read `data_ig.parquet`
+when present; otherwise call `data.load_merged_prints` with thresholds
+`15 / 0.005 / 0.2` and cache the result. Then read the Wells quotes parquet,
+restrict it to CUSIPs in the supplied three-month TRACE table, convert UTC to ET,
+and map issuer from TRACE. Unrelated model/feature imports are not required.
+
+Select an **issuer** after loading. One screenshot-friendly figure shows:
+
+- Left: positive / zero / missing / other quantity shares for each dealer,
+  using every raw row for that issuer as the dealer-specific denominator.
+- Right: the positive raw quantity distribution across **all** that issuer's
+  dealers. Small discrete distributions use exact-value bars; larger ones use
+  a clearly labelled log10 histogram covering the entire positive range.
+
+Dealer pages contain eight dealers. Paging changes only the left panel.
+**Save PNG** exports the current figure to `outputs/quote_quality_step1/`.
+No large DataFrames are printed; `quantity_result` holds the counts and figure.
+
+Quantity is **not** converted to MM/par. Zero remains separate from missing.
+Only true nulls count as missing; negative, infinite and unparseable non-null
+values (including blank strings) count as other. Numeric strings are read as
+numbers for classification; the original `quantity` values remain intact.
+Repeated rows and concurrent quotes remain in the counts. Missing issuer/dealer
+labels remain visible. No spread cleaning, deduplication, crossing analysis,
+expiry, smoothing or feature generation runs in this notebook. TRACE is already
+clean and the confirmed spread multipliers are not changed.
+
+Install `requirements.txt` in the notebook environment if needed. The local
+`data.load_merged_prints` dependency is needed only when the TRACE cache is absent.
+The repository contains no private input data or executed real-data outputs.
+
+---
+
+The earlier EDA below is a separate notebook; it is not run by step 1.
+
 # Interactive quote EDA
 
 Open [quote_eda.ipynb](quote_eda.ipynb) in the kernel containing `bcq_df` and
