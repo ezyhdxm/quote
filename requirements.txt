@@ -4,3 +4,4 @@ plotly>=5.18
 ipython>=8
 nbformat>=5.9
 pyarrow>=12
+ipywidgets>=8

@@ -50,4 +50,10 @@ def make_demo(seed=7):
     q = pd.concat([q, q.iloc[:10]], ignore_index=True)  # exact duplicate examples
     t = pd.DataFrame(trades, columns=["CUSIP", "EFFECTIVE_DATETIME_TS", "BM_SPREAD", "QUANTITY",
                                       "EFF_SIDE", "ISSUER", "YRS_TO_MATURITY"])
-    return q, t, metadata
+    # A second issuer makes the dropdown usable in the demo itself.
+    alternate_ids = dict(zip(cusips, [f"ALT{i:06d}" for i in range(8)]))
+    q2 = q.assign(cusip=q["cusip"].map(alternate_ids), spread=q["spread"]*.8+8)
+    t2 = t.assign(CUSIP=t["CUSIP"].map(alternate_ids), BM_SPREAD=t["BM_SPREAD"]*.8+.08,
+                  ISSUER="Second Demo Issuer")
+    m2 = metadata.assign(CUSIP=metadata["CUSIP"].map(alternate_ids), ISSUER="Second Demo Issuer")
+    return pd.concat([q,q2],ignore_index=True), pd.concat([t,t2],ignore_index=True), pd.concat([metadata,m2],ignore_index=True)
