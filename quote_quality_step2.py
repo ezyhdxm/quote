@@ -1,18 +1,21 @@
 # %% [markdown]
 # # Step 2 — repeated content and same-timestamp multi-spread quotes
-# Run the three code cells, then choose issuer and Overview / Case.
-# Each group is dealer × bond × side × exact event timestamp. Raw records stay
-# intact; no latest/median selection, expiry, crossing removal or smoothing.
+# Run the three code cells. Overview asks **where same-side multi-spread events occur**;
+# Case shows **which spreads and quantities coexist at one timestamp**.
+# An event = dealer × bond × side × exact timestamp. Two bids at the same time
+# are two candidates, not a time-series jump or a bid/ask crossing.
+# The front of the issuer dropdown contains deliberately selected research cases.
 
 # %% 1. Load data — same paths and cache logic as step 1
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+from io import BytesIO
+from matplotlib.figure import Figure
 import matplotlib.dates as mdates
 from matplotlib.ticker import PercentFormatter
 import ipywidgets as widgets
-from IPython.display import display, clear_output
+from IPython.display import display
 
 PIPELINE_CSV = Path("data/pipeline/data_pipeline.csv_20260506")
 BENCHMARK_CSV = Path("data/pipeline/DailyCloseUSTBenchmarks.csv_20260506")
@@ -47,13 +50,16 @@ cusip_issuer = (data_ig[["ISSUER", "CUSIP"]].dropna()
 bcq_df["ISSUER"] = bcq_df["cusip"].map(cusip_issuer)
 
 # %% [markdown]
-# ## What the figures mean
-# A multi-spread group contains >=2 distinct finite spreads. Exact repeated
-# content is counted across all loaded columns, without removing rows.
-# Groups containing a nonfinite/unparseable spread are incomplete, even if they
-# also contain two finite candidates. Quantity categories are mutually exclusive:
-# Missing/other first, then contains zero, then different/same positive values.
-# Zero quantity is not zero spread. Positive quantity stays in original units.
+# ## Read the figures
+# - **Dealer panel:** multi-spread events / all events for that dealer.
+# - **Quantity panel:** composition of the issuer's multi-spread events; shares sum to 100%.
+#   All-zero and zero/positive mixtures are shown separately. This does not establish size effects.
+# - **Gap panel:** distribution of max spread minus min spread **at the same timestamp**.
+# - **Case:** full-day raw spread points plus separate candidates at the selected timestamp.
+#   Candidate row numbers are display positions, not quote identities tracked through time.
+# Each event counts once. Repeated content means extra identical rows across all loaded fields;
+# it does not include unchanged quotes at different timestamps. Incomplete spreads stay unassessed.
+# Quantity units remain unknown; zero quantity is not zero spread. Raw records are retained.
 
 # %% 2. Analyze one issuer and define the overview and case figures
 KEYS = ["firm", "cusip", "side", "quote_timestamp_ET"]
@@ -165,100 +171,136 @@ def representative_issuers():
 
 def overview_figure(result, page=1):
     g = result["groups"]
+    multi = g.loc[g["multi"]]
+    n, m = len(g), len(multi)
     dealer = g.groupby("firm", observed=True)["multi"].agg(["sum", "count"])
-    dealer = dealer.sort_values("count", ascending=False, kind="stable")
+    dealer = dealer.sort_values(["sum", "count"], ascending=False, kind="stable")
     shown = dealer.iloc[(page - 1) * DEALERS_PER_PAGE:page * DEALERS_PER_PAGE]
-    by_q = g.groupby("qclass", observed=True)["multi"].agg(["sum", "count"]).reindex(QKINDS, fill_value=0)
-    fig, axes = plt.subplots(1, 3, figsize=(17, 7), facecolor="white")
-    fig.subplots_adjust(left=0.16, right=0.98, top=0.72, bottom=0.26, wspace=0.52)
+    # Composition among multi-spread events, not the old within-category rates.
+    qlabels = ["Same positive", "Different positive", "All zero", "Zero + positive", "Missing / other"]
+    qtypes = multi["qclass"].where(~multi["has_zero"], "Zero + positive")
+    qtypes = qtypes.mask(multi["all_zero"], "All zero").mask(multi["has_unknown"], "Missing / other")
+    qcounts = qtypes.value_counts().reindex(qlabels, fill_value=0)
+    fig = Figure(figsize=(17, 7.5), facecolor="white")
+    a, b, c = fig.subplots(1, 3)
+    fig.subplots_adjust(left=0.14, right=0.97, top=0.70, bottom=0.25, wspace=0.62)
     times = result["raw"]["quote_timestamp_ET"].dropna()
     dates = f"{times.min():%Y-%m-%d} to {times.max():%Y-%m-%d} ET" if len(times) else "No valid dates"
-    fig.suptitle(f"{result['issuer']}\nStep 2: repeated content or multiple spreads at the same timestamp?", fontsize=17, y=0.99)
-    fig.text(0.5, 0.86, f"{dates} | raw rows={len(result['raw']):,} | repeated rows={result['repeated_rows']:,} (all loaded fields)", ha="center", fontsize=11)
-    n, m = len(g), int(g["multi"].sum())
-    rate = f"{m / n:.1%}" if n else "N/A"
-    balanced = f"{result['day_balanced_rate']:.1%}" if result["day_count"] else "N/A"
-    affected = f"{result['affected_day_rate']:.1%}" if result["day_count"] else "N/A"
-    fig.text(0.5, 0.82, f"Multi-spread={m:,}/{n:,} groups ({rate}) | day-balanced rate={balanced} | affected days={affected} of {result['day_count']:,}", ha="center", fontsize=11)
-    fig.text(0.5, 0.78, f"Incomplete spreads: {result['bad_spread_rows']:,} rows; {int(g['bad_spreads'].gt(0).sum()):,} keyed groups | unkeyed rows={result['unkeyed_rows']:,}", ha="center", fontsize=10, color="#8A3B4B")
-    a, b, c = axes
+    fig.suptitle(f"{result['issuer']}\nStep 2 | Multiple spreads on the same side, at the same time", fontsize=17, y=0.98)
+    rate = f"{m / n:.2%}" if n else "N/A"
+    fig.text(0.5, 0.84, f"{m:,} of {n:,} events ({rate}) have multiple spreads", ha="center", fontsize=15, weight="bold")
+    fig.text(0.5, 0.79, f"{dates} | {len(result['raw']):,} raw rows | {result['repeated_rows']:,} extra identical rows", ha="center", fontsize=11)
     a.barh(np.arange(len(shown)), shown["sum"].div(shown["count"]) * 100, color=QCOLORS[0])
-    labels = [f"{str(firm)[:22]}\n{int(row['sum']):,}/{int(row['count']):,} ({row['sum'] / row['count']:.1%})" for firm, row in shown.iterrows()]
-    a.set_yticks(np.arange(len(shown)), labels, fontsize=10)
+    labels = [f"{firm}\n{int(r['sum']):,}/{int(r['count']):,} ({r['sum'] / r['count']:.2%})" for firm, r in shown.iterrows()]
+    a.set_yticks(np.arange(len(shown)), labels, fontsize=9)
     a.invert_yaxis()
+    a.set_title(f"1. Which dealers?\nMost multi-spread events first | page {page}", fontsize=12)
+    a.set_xlabel("Multi-spread / this dealer's events")
     if shown.empty:
-        a.text(0.5, 0.5, "No keyed groups", ha="center", transform=a.transAxes)
-    a.set_title(f"Which dealers have multi-spread groups?\nPage {page}; {len(dealer)} dealers", fontsize=11)
-    b.barh(np.arange(4), by_q["sum"].div(by_q["count"].replace(0, np.nan)) * 100, color=QCOLORS)
-    b.set_yticks(np.arange(4), [f"{k}\n{int(r['sum']):,}/{int(r['count']):,}" + (f" ({r['sum'] / r['count']:.1%})" if r['count'] else " (unobserved)") for k, r in by_q.iterrows()], fontsize=10)
-    b.set_ylim(3.6, -0.6)
-    b.set_title("Does quantity distinguish the cases?\nAll issuer dealers, independent of page", fontsize=11)
+        a.text(0.5, 0.5, "No keyed events", ha="center", transform=a.transAxes)
+    b.barh(np.arange(5), qcounts / m * 100 if m else np.zeros(5),
+           color=[QCOLORS[0], QCOLORS[1], QCOLORS[2], "#E9BA70", QCOLORS[3]])
+    b.set_yticks(np.arange(5), [f"{k}\n{v:,}/{m:,} ({v / m:.1%})" if m else f"{k}\nN/A: no multi-spread events" for k, v in qcounts.items()], fontsize=9)
+    b.set_ylim(4.6, -0.6)
+    b.set_title("2. What quantities accompany them?\nComposition of all multi-spread events", fontsize=12)
+    b.set_xlabel("Share of issuer's multi-spread events")
     for axis in [a, b]:
         axis.set_xlim(0, 100)
         axis.xaxis.set_major_formatter(PercentFormatter(100))
-        axis.set_xlabel("Multi-spread groups / all groups")
-    ranges = g.loc[g["multi"], "range_bps"].sort_values().to_numpy()
-    if len(ranges):
-        c.step(ranges, np.arange(1, len(ranges) + 1) / len(ranges) * 100, where="post", color=QCOLORS[1])
+        axis.grid(axis="x", alpha=0.15)
+        axis.set_axisbelow(True)
+    ranges = multi["range_bps"].sort_values().to_numpy()
+    if m:
+        c.step(ranges, np.arange(1, m + 1) / m * 100, where="post", color=QCOLORS[1])
         c.set_xscale("log")
-        c.text(0.98, 0.08, f"N={len(ranges):,}\nMedian={np.median(ranges):g} bps\nMax={ranges[-1]:g} bps", ha="right", transform=c.transAxes, fontsize=10)
+        c.text(0.98, 0.06, f"{m:,} events\nMedian gap = {np.median(ranges):g} bps\nMax gap = {ranges[-1]:g} bps", ha="right", transform=c.transAxes, fontsize=10)
     else:
-        c.text(0.5, 0.5, "No same-timestamp multi-spread groups", ha="center", wrap=True, transform=c.transAxes)
+        c.text(0.5, 0.5, "No observed multi-spread events", ha="center", wrap=True, transform=c.transAxes)
         c.set_xticks([])
-    c.set_title("How far apart are the candidates?\nECDF; all multi-spread groups", fontsize=11)
-    c.set_xlabel("Spread range (bps; log scale)")
+    c.set_title("3. How far apart at that instant?\nCumulative distribution of candidate gaps", fontsize=12)
+    c.set_xlabel("Same-time max - min spread (bps; log)")
+    c.set_ylabel("Events with a gap at or below x")
     c.set_ylim(0, 105)
     c.yaxis.set_major_formatter(PercentFormatter(100))
-    fig.text(0.16, 0.10, "Group = dealer / bond / side / exact ET timestamp. All keyed groups are denominators, including incomplete groups.\nDay-balanced = mean of daily multi-group fractions; affected days = any multi group per dealer-bond-side-day.\nQuantity: missing/other takes priority, then contains zero, then different/same positive values. Zero size is not zero spread.", fontsize=10)
-    fig.text(0.16, 0.035, "Raw candidates retained. An incomplete group is unassessed beyond its observed finite values; multi-spread does not prove corruption.", fontsize=10, color="#8A3B4B")
+    incomplete = int(g["bad_spreads"].gt(0).sum())
+    fig.text(0.14, 0.15, "Event = same dealer / bond / side / exact timestamp. Each event counts once.\nMiddle panel: all multi-spread events are the denominator. Right panel: candidate disagreement, not a move over time.", fontsize=11)
+    fig.text(0.14, 0.07, f"Incomplete spreads: {result['bad_spread_rows']:,} rows in {incomplete:,} keyed groups; unkeyed rows={result['unkeyed_rows']:,}.\nIncomplete values remain unassessed. Multiple spreads, zero quantity and a large gap do not by themselves prove corruption.", fontsize=10, color="#8A3B4B")
     return fig
 
-def case_figure(result, event, minutes=15, value_page=1):
+
+def case_figure(result, event, minutes=None, value_page=1):
     q, t = result["quotes"], event["quote_timestamp_ET"]
     mask = q["firm"].eq(event["firm"]) & q["cusip"].eq(event["cusip"]) & q["side"].eq(event["side"])
     mask &= q["quote_timestamp_ET"].dt.normalize().eq(t.normalize())
-    mask &= q["quote_timestamp_ET"].between(t - pd.Timedelta(minutes=minutes), t + pd.Timedelta(minutes=minutes))
-    local = q.loc[mask].sort_values("quote_timestamp_ET", kind="stable")
-    selected = local.loc[local["quote_timestamp_ET"].eq(t)]
-    fig, (a, b) = plt.subplots(2, 1, sharex=True, figsize=(14, 8), facecolor="white")
-    fig.subplots_adjust(left=0.09, right=0.71, top=0.79, bottom=0.17, hspace=0.15)
-    fig.suptitle(f"{result['issuer']} | {event['cusip']} | {event['side']}\nDealer {event['firm']} | event {t.isoformat()} ET", fontsize=14, y=0.98)
-    zero_kind = "all zero" if event["all_zero"] else "zero / positive mix"
-    category = zero_kind if event["qclass"] == "Contains zero" else event["qclass"]
-    fig.text(0.09, 0.85, f"Event: {int(event['rows'])} raw rows, {int(event['repeats'])} repeated rows, {int(event['n_spreads'])} finite spreads\nQuantity: {category} | nonfinite spreads={int(event['bad_spreads'])} | local raw rows={len(local):,}", fontsize=11)
-    for kind, color, marker in zip(["Positive", "Zero", "Missing", "Other"],
-                                   ["#287D8E", "#D98B20", "#A5ADB8", "#A25367"], ["o", "x", "^", "s"]):
-        rows = local.loc[local["qkind"].eq(kind)]
-        a.scatter(rows["quote_timestamp_ET"], rows["s"], c=color, marker=marker, s=28, label=kind, alpha=0.65)
-        if kind in ["Positive", "Zero"]:
-            b.scatter(rows["quote_timestamp_ET"], rows["q"], c=color, marker=marker, s=28, alpha=0.65)
-    a.scatter(selected["quote_timestamp_ET"], selected["s"], s=120, facecolors="none", edgecolors="#222222", linewidths=1.3)
-    for axis in [a, b]:
-        axis.axvline(t, color="#555555", ls=":", lw=1)
-        axis.grid(alpha=0.15)
-        axis.set_xlim(max(t.normalize(), t - pd.Timedelta(minutes=minutes)),
-                      min(t.normalize() + pd.DateOffset(days=1), t + pd.Timedelta(minutes=minutes)))
-    a.set_ylabel("Benchmark spread (bps)")
-    a.legend(loc="lower left", bbox_to_anchor=(1.02, 0.02), ncol=2, fontsize=9)
-    b.set_ylabel("Raw quantity\n(unit unconfirmed)")
-    b.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=t.tz))
-    b.set_xlabel(f"Event time ET; +/-{minutes} min within the same day; no connecting lines")
-    # Paginated event values keep exact candidates visible without a large table.
-    candidates = selected[["spread", "quantity"]].copy()
-    candidates["spread"] = candidates["spread"].astype(str)
-    candidates["quantity"] = candidates["quantity"].astype(str)
-    values = candidates.groupby(["spread", "quantity"], dropna=False, sort=False).size()
-    lines = [f"spread={s}; q={size}; rows={count}" for (s, size), count in values.items()]
+    day = q.loc[mask].sort_values("quote_timestamp_ET", kind="stable")
+    local = day if minutes is None else day.loc[day["quote_timestamp_ET"].between(t - pd.Timedelta(minutes=minutes), t + pd.Timedelta(minutes=minutes))]
+    selected = day.loc[day["quote_timestamp_ET"].eq(t)]
+    # Separate candidate rows avoid overplotting two zero quantities at one point.
+    # Row positions are labels only; neither candidate identities nor size ordering.
+    candidates = selected.assign(spread_text=selected["spread"].astype(str), quantity_text=selected["quantity"].astype(str))
+    values = candidates.groupby(["spread_text", "quantity_text"], sort=False, dropna=False).agg(
+        rows=("s", "size"), s=("s", "first"), qkind=("qkind", "first"),
+    ).reset_index()
     start = (value_page - 1) * 8
-    a.text(1.02, 0.98, "Exact event candidates (raw units)\n" + "\n".join(lines[start:start + 8]) +
-           f"\nValues {start + 1}-{min(start + 8, len(lines))} of {len(lines)}", transform=a.transAxes, va="top", fontsize=10)
-    counts = local["qkind"].value_counts()
-    b.text(1.02, 0.98, "Quantity rows in this window\n" + "\n".join(f"{k}: {counts.get(k, 0):,}" for k in ["Positive", "Zero", "Missing", "Other"]) +
-           "\nMissing/other: no numeric position", transform=b.transAxes, va="top", fontsize=10)
-    explanation = "Different positive quantities accompany these candidates; conditions may differ." if category == "Different positive" else "Quantity does not uniquely distinguish the observed price candidates."
+    shown = values.iloc[start:start + 8]
+    fig = Figure(figsize=(16, 8), facecolor="white")
+    a, b = fig.subplots(1, 2, gridspec_kw={"width_ratios": [1.65, 1]})
+    fig.subplots_adjust(left=0.08, right=0.94, top=0.75, bottom=0.29, wspace=0.40)
+    fig.suptitle(f"{result['issuer']} | {event['cusip']} | {event['side']}\nDealer {event['firm']} | {t.isoformat()}", fontsize=15, y=0.98)
+    gap = f"{event['range_bps']:g} bps" if event["n_spreads"] else "unassessed"
+    fig.text(0.5, 0.84, f"Selected instant: {int(event['n_spreads'])} distinct finite spreads | gap = {gap} | {int(event['rows'])} raw rows", ha="center", fontsize=13, weight="bold")
+    colors = dict(zip(["Positive", "Zero", "Missing", "Other"], [QCOLORS[0], QCOLORS[2], "#8895A7", QCOLORS[3]]))
+    markers = dict(zip(colors, ["o", "x", "^", "s"]))
+    for kind in colors:
+        rows = local.loc[local["qkind"].eq(kind)]
+        if len(rows):
+            a.scatter(rows["quote_timestamp_ET"], rows["s"], c=colors[kind], marker=markers[kind], s=28, label=f"Quantity: {kind.lower()}", alpha=0.65)
+    a.scatter(selected["quote_timestamp_ET"], selected["s"], s=110, facecolors="none", edgecolors="#222222", linewidths=1.3)
+    a.axvline(t, color="#555555", ls=":", lw=1)
+    if minutes is None:
+        left, right = day["quote_timestamp_ET"].min(), day["quote_timestamp_ET"].max()
+        padding = max((right - left) / 30, pd.Timedelta(minutes=1))
+        left, right = left - padding, right + padding
+    else:
+        left, right = t - pd.Timedelta(minutes=minutes), t + pd.Timedelta(minutes=minutes)
+    a.set_xlim(max(t.normalize(), left), min(t.normalize() + pd.DateOffset(days=1), right))
+    a.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=6, tz=t.tz))
+    a.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=t.tz))
+    a.set_ylabel("Benchmark spread (bps)")
+    window = "Full day" if minutes is None else f"+/- {minutes} min"
+    n_times = local["quote_timestamp_ET"].nunique()
+    a.set_title(f"{window}: {len(local):,} raw rows at {n_times:,} timestamps\nCircles identify the selected instant", fontsize=12)
+    a.set_xlabel(f"{t:%Y-%m-%d} ET | points at actual timestamps")
+    fig.legend(*a.get_legend_handles_labels(), loc="upper left", bbox_to_anchor=(0.08, 0.225), ncol=4, fontsize=9, borderaxespad=0)
+    a.grid(alpha=0.15)
+    b.set_yticks(np.arange(len(shown)), [f"#{start + i + 1}  q={row.quantity_text}\n{row.rows} raw row(s)" for i, row in enumerate(shown.itertuples())], fontsize=10)
+    for i, row in enumerate(shown.itertuples()):
+        if pd.notna(row.s):
+            b.scatter(row.s, i, color=colors[row.qkind], marker=markers[row.qkind], s=75)
+            b.annotate(f"spread={row.spread_text}", (row.s, i), xytext=(6, 9), textcoords="offset points", fontsize=10)
+        else:
+            b.text(0.5, i, f"spread={row.spread_text} (not finite)", transform=b.get_yaxis_transform(), ha="center", fontsize=10)
+    b.set_ylim(len(shown) - 0.3, -0.7)
+    b.margins(x=0.35)
+    b.set_xlabel("Benchmark spread (bps) | separate event scale")
+    b.set_title(f"Candidates at the selected instant only\nValues {start + 1}-{min(start + 8, len(values))} of {len(values)}", fontsize=12)
+    b.grid(axis="x", alpha=0.15)
+    if event["all_zero"]:
+        meaning = "All quantities are zero: size information cannot distinguish these candidates."
+    elif event["qclass"] == "Same positive":
+        meaning = "The same positive quantity accompanies different spreads; other conditions remain unknown."
+    elif event["qclass"] == "Different positive":
+        ambiguous_size = selected.groupby("q")["s"].nunique().gt(1).any()
+        meaning = ("Different quantities occur, but a quantity still maps to multiple spreads." if ambiguous_size else
+                   "Different positive quantities accompany the spreads; a size effect is not yet established.")
+    else:
+        meaning = "Zero / missing / other quantities leave quote conditions partly unknown."
     if not event["multi"]:
-        explanation = "No observed multi-spread at this timestamp; incomplete values remain unassessed." if event["bad_spreads"] else "Single-spread control; identical content may still be repeated."
-    fig.text(0.09, 0.07, f"Observed: finite spread range={event['range_bps']:g} bps. {explanation}\nUnknown: execution, missing conditions and candidate identity. Missing/other quantity appears by symbol in the spread panel, not as numeric zero.", fontsize=10)
+        meaning = "No observed multi-spread here; incomplete spread values remain unassessed." if event["bad_spreads"] else "One observed spread at this timestamp; this does not validate the quote's economic meaning."
+    context = ("Only one timestamp in this window: persistence cannot be assessed." if n_times <= 1 else
+               "Inspect whether multiple levels recur; the plot does not assign identities across timestamps.")
+    fig.text(0.08, 0.135, meaning + "\n" + context, fontsize=11)
+    fig.text(0.08, 0.055, f"Same-side candidates coexist; their gap is not a time-series jump or a bid/ask width. Quantity is in raw, unconfirmed units.\nSelected event: {int(event['repeats'])} extra identical rows; {int(event['bad_spreads'])} nonfinite spreads. Row labels are display positions only.", fontsize=10, color="#6A4F39")
     return fig
 
 # %% [markdown]
@@ -267,11 +309,18 @@ def case_figure(result, event, minutes=15, value_page=1):
 # quantity category, complete single-spread controls and incomplete groups.
 # Dealer/bond/side/date are selectable. Events paginate 50 at a time;
 # every eligible event is accessible and overview statistics are never sampled.
-# Candidate values paginate eight per screenshot. All rows remain in step2_result.
+# Candidate values paginate eight per screenshot. Full day is the default; switch to a local window to zoom.
+# All rows remain in step2_result. Optional counting details are collapsed below the controls.
 # Representative issuers lead the dropdown, interleaving supported multi-spread
 # patterns and active controls; the remaining issuers follow alphabetically.
 
 # %% 3. Dropdown controls and PNG export
+# Detach old observers when rerunning this cell in the same kernel.
+if "step2_controls" in globals():
+    for control in step2_controls:
+        control.unobserve(refresh_step2, names="value")
+    save_button.on_click(save_step2, remove=True)
+    step2_dashboard.close()
 issuer_options, issuer_summary = representative_issuers()
 issuer_box = widgets.Dropdown(options=issuer_options, description="Issuer:", layout=widgets.Layout(width="850px"))
 if not issuer_box.options:
@@ -285,12 +334,14 @@ side_box = widgets.Dropdown(description="Side:")
 date_box = widgets.Dropdown(description="ET date:")
 event_box = widgets.Dropdown(description="Event:", layout=widgets.Layout(width="650px"))
 event_page = widgets.Dropdown(options=[1], description="Event page:")
+window_mode = widgets.ToggleButtons(options=["Full day", "Local window"], description="Window:")
 window_box = widgets.IntSlider(value=15, min=1, max=60, description="+/- min:", continuous_update=False)
 values_page = widgets.Dropdown(options=[1], description="Values page:")
 save_button = widgets.Button(description="Save PNG", icon="download")
-save_status, plot_output = widgets.HTML(), widgets.Output()
+save_status, details = widgets.HTML(), widgets.HTML()
+plot_output = widgets.Image(format="png", layout=widgets.Layout(width="100%", max_width="1500px"))
 case_controls = widgets.VBox([case_type, widgets.HBox([dealer_box, bond_box, side_box]),
-                              widgets.HBox([date_box, window_box, values_page]), widgets.HBox([event_page, event_box])])
+                              widgets.HBox([date_box, values_page]), widgets.HBox([window_mode, window_box]), widgets.HBox([event_page, event_box])])
 step2_result, current_figure, busy = None, None, False
 
 def refresh_step2(change=None):
@@ -299,13 +350,12 @@ def refresh_step2(change=None):
         return
     busy = True
     try:
-        if current_figure is not None:
-            plt.close(current_figure)
         if step2_result is None or step2_result["issuer"] != issuer_box.value:
             step2_result = analyze_issuer(issuer_box.value)
             page_box.options = range(1, max(1, (step2_result["groups"]["firm"].nunique() + 7) // 8) + 1)
             page_box.value = 1
         g = step2_result["groups"]
+        window_box.layout.display = "" if window_mode.value == "Local window" else "none"
         page_box.layout.display = "" if view_box.value == "Overview" else "none"
         case_controls.layout.display = "none" if view_box.value == "Overview" else ""
         if view_box.value == "Overview":
@@ -338,7 +388,8 @@ def refresh_step2(change=None):
             event_box.options = [(f"{r['quote_timestamp_ET'].isoformat()} | {r['n_spreads']} spreads | {r['range_bps']:g} bps", i) for i, r in sample.iterrows()]
             event_box.value = previous if not reset and previous in sample.index else (sample.index[0] if len(sample) else None)
             if event_box.value is None:
-                current_figure, ax = plt.subplots(figsize=(12, 5))
+                current_figure = Figure(figsize=(12, 5), facecolor="white")
+                ax = current_figure.subplots()
                 ax.axis("off")
                 ax.text(0.5, 0.5, f"{issuer_box.value}\nNo groups match: {case_type.value}\nChoose another case type or issuer.", ha="center", va="center", fontsize=14)
             else:
@@ -351,13 +402,28 @@ def refresh_step2(change=None):
                 prior = values_page.value
                 values_page.options = range(1, max(1, (n_values + 7) // 8) + 1)
                 values_page.value = prior if prior in values_page.options and change is not None and change["owner"] is values_page else 1
-                current_figure = case_figure(step2_result, event, window_box.value, values_page.value)
-                current_figure.text(0.09, 0.015, f"Event selector page {event_page.value}/{len(event_page.options)}: {len(sample)} of {len(eligible):,} eligible groups for this dealer/bond/side/day. Every group is accessible.", fontsize=10)
+                current_figure = case_figure(step2_result, event, window_box.value if window_mode.value == "Local window" else None, values_page.value)
+                current_figure.text(0.09, 0.015, f"Event page {event_page.value}/{len(event_page.options)} | {len(eligible):,} eligible events for this dealer / bond / side / day | all events accessible", fontsize=10)
         save_status.value = ""
-        with plot_output:
-            clear_output(wait=True)
-            display(current_figure)
-        plt.close(current_figure)
+        r = step2_result
+        balanced = f"{r['day_balanced_rate']:.2%}" if r["day_count"] else "N/A"
+        affected = f"{r['affected_day_rate']:.2%}" if r["day_count"] else "N/A"
+        details.value = (
+            "<details><summary>Counting details and interpretation</summary>"
+            f"<p>Day-balanced multi-spread rate: {balanced}. Dealer-bond-side-days with any multi-spread: {affected} "
+            f"of {r['day_count']:,}. These are dealer/bond/side/day units, not calendar days.</p>"
+            "<p>Day-balanced = mean of each unit's multi-spread fraction. "
+            "All keyed events, including incomplete ones, stay in denominators. "
+            "Unknown quantities take priority over zero, then different/same positive quantities. "
+            "Extra identical rows match all loaded fields; unchanged quotes at later timestamps are separate events.</p>"
+            "<p>Front-of-dropdown issuers are selected research cases, not a population sample or a quality ranking. "
+            "No observed multi-spread does not certify a clean issuer.</p></details>"
+        )
+        # An unmanaged Figure rendered into ONE image widget avoids both inline
+        # auto-display and explicit-display paths emitting the same figure twice.
+        with BytesIO() as buffer:
+            current_figure.savefig(buffer, format="png", dpi=110, facecolor="white")
+            plot_output.value = buffer.getvalue()
     finally:
         busy = False
 
@@ -365,13 +431,15 @@ def save_step2(change=None):
     folder = Path("outputs/quote_quality_step2")
     folder.mkdir(parents=True, exist_ok=True)
     name = "".join(c if c.isalnum() else "_" for c in str(issuer_box.value))[:60]
-    suffix = f"overview_{page_box.value}" if view_box.value == "Overview" else f"case_{event_box.value}_values_{values_page.value}"
+    suffix = f"overview_{page_box.value}" if view_box.value == "Overview" else f"case_{event_box.value}_values_{values_page.value}_{'day' if window_mode.value == 'Full day' else str(window_box.value) + 'min'}"
     path = folder / f"{name}_{suffix}.png"
     current_figure.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
     save_status.value = f"Saved: {path}"
 
-for box in [issuer_box, view_box, page_box, case_type, dealer_box, bond_box, side_box, date_box, event_page, event_box, window_box, values_page]:
+step2_controls = [issuer_box, view_box, page_box, case_type, dealer_box, bond_box, side_box, date_box, event_page, event_box, window_mode, window_box, values_page]
+for box in step2_controls:
     box.observe(refresh_step2, names="value")
 save_button.on_click(save_step2)
-display(widgets.VBox([issuer_box, widgets.HBox([view_box, page_box, save_button]), case_controls, save_status, plot_output]))
+step2_dashboard = widgets.VBox([issuer_box, widgets.HBox([view_box, page_box, save_button]), case_controls, details, save_status, plot_output])
+display(step2_dashboard)
 refresh_step2()

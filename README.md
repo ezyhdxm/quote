@@ -23,13 +23,18 @@ plots are still built on demand. `issuer_summary` holds the ranking evidence
 without automatically printing a table. The front section is research case
 selection, not a random sample or a dealer/issuer quality score.
 
-- **Overview:** dealer multi-spread rates, rates by quantity category, and the
-  full distribution of within-group spread ranges. Numerators and denominators
-  are labelled. Dealer pages change only the dealer panel.
+- **Overview:** dealer multi-spread rates (most multi-spread events first),
+  **quantity composition among multi-spread events**, and the cumulative distribution
+  of same-time candidate gaps. The middle panel sums to 100%; it splits all-zero
+  from zero/positive mixtures. Its denominator is all issuer multi-spread events,
+  not all events in that quantity category. Dealer pages change only the left panel.
 - **Case:** choose case type, dealer, bond, side and ET date. Select an event and
-  inspect raw spread and quantity points in a configurable same-day window.
-  Every eligible event is accessible through pages of 50; exact candidate
-  values paginate eight per figure.
+  inspect a **full day** of raw spread points, or switch to a local +/- minute window.
+  The right panel shows each selected-time spread/quantity combination separately,
+  labelled with raw quantity and row count. Two q=0 candidates remain separately
+  visible. Row numbers are display positions, not tracked quote identities.
+  Every eligible event is accessible through pages of 50; candidate values
+  paginate eight per figure. No candidates are joined into an inferred curve.
 - **Save PNG:** export the displayed figure to `outputs/quote_quality_step2/`.
   Detailed raw rows and group counts remain in `step2_result`; no large tables
   are printed.
@@ -40,8 +45,15 @@ counted across all loaded fields, without deleting rows. Nonfinite spread rows,
 incomplete groups and rows missing grouping keys are reported separately.
 Incomplete groups remain in the rate denominators; the multi-spread rate counts
 observed finite candidates and does not certify the other groups as clean.
-The day-balanced rate averages within-day group rates across
-dealer-bond-side-days; affected-day coverage measures days with any multi-spread.
+The collapsed **Counting details and interpretation** panel retains the day-balanced
+rate (average group rate across dealer-bond-side-days) and affected-day coverage
+(units with any multi-spread). These units are not calendar days. Extra identical
+rows do not count unchanged quotes at later timestamps.
+
+The charts render into one PNG image widget, using unmanaged Matplotlib figures;
+there is no second inline figure display. Rerunning the controls cell detaches
+its old observers. When replacing an older notebook, restart the kernel and run
+all three cells once to clear the old dashboard and its saved outputs.
 
 Quantity categories are mutually exclusive: missing/other first, then contains
 zero, then different/same positive values. Units and economic meaning remain

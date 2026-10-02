@@ -144,7 +144,7 @@ class MultiSpreadChecks(unittest.TestCase):
         state["view_box"].value = "Case"
         self.assertEqual(tuple(state["values_page"].options), (1, 2, 3))
         state["values_page"].value = 3
-        texts = " ".join(t.get_text() for ax in state["current_figure"].axes for t in ax.texts)
+        texts = " ".join([ax.get_title() for ax in state["current_figure"].axes] + [t.get_text() for ax in state["current_figure"].axes for t in ax.texts])
         self.assertIn("Values 17-17 of 17", texts)
         self.assertIn("spread=16", texts)
         self.assertEqual(len(state["step2_result"]["raw"]), 17)
@@ -197,6 +197,57 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertTrue(incomplete["multi"])
         self.assertEqual(incomplete["n_spreads"], 2)
         self.assertEqual(incomplete["bad_spreads"], 1)
+
+    def test_quantity_composition_counts_events_and_splits_zero_cases(self):
+        state, _ = load_dashboard()
+        panel = state["current_figure"].axes[1]
+        # Six multi-spread events: one same-positive, one different-positive,
+        # one all-zero, one zero/positive mix, two missing/other.
+        shares = [p.get_width() for p in panel.patches]
+        np.testing.assert_allclose(shares, [100 / 6] * 4 + [200 / 6])
+        self.assertAlmostEqual(sum(shares), 100)
+        labels = " ".join(t.get_text() for t in panel.get_yticklabels())
+        self.assertIn("All zero", labels)
+        self.assertIn("Zero + positive", labels)
+        self.assertIn("2/6", labels)
+
+    def test_full_day_context_and_separate_zero_candidates(self):
+        quotes, trades = fixture()
+        raw = pd.concat([quotes.iloc[[0]]] * 4, ignore_index=True)
+        raw["quantity"] = 0
+        raw["spread"] = [89, 102, 90, 103]
+        raw["quote_timestamp_UTC"] = ["2026-03-02T12:30:22Z"] * 2 + ["2026-03-02T20:00:00Z"] * 2
+        state, _ = load_dashboard(raw, trades)
+        state["view_box"].value = "Case"
+        timeline, candidates = state["current_figure"].axes
+        self.assertIn("4 raw rows at 2 timestamps", timeline.get_title())
+        labels = [x.get_text() for x in candidates.get_yticklabels()]
+        self.assertEqual(len(labels), 2)
+        self.assertTrue(all("q=0" in x for x in labels))
+        offsets = [tuple(c.get_offsets()[0]) for c in candidates.collections]
+        self.assertEqual(offsets, [(89, 0), (102, 1)])
+        state["window_mode"].value = "Local window"
+        self.assertIn("2 raw rows at 1 timestamps", state["current_figure"].axes[0].get_title())
+        self.assertIn("Only one timestamp", " ".join(t.get_text() for t in state["current_figure"].texts))
+
+    def test_refresh_has_one_image_and_rerun_detaches_previous_callbacks(self):
+        state, show = load_dashboard()
+        old_control = state["view_box"]
+        old_image = state["plot_output"]
+        old_model = old_image.model_id
+        self.assertTrue(old_image.value.tobytes().startswith(b"\x89PNG"))
+        self.assertEqual(plt.get_fignums(), [])  # Nothing for inline backend to auto-display.
+        state["view_box"].value = "Case"
+        self.assertEqual(state["plot_output"].model_id, old_model)
+        cell3 = SCRIPT.read_text().split("# %% 3. Dropdown controls and PNG export\n")[1]
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(cell3, str(SCRIPT), "exec"), state)
+        figure = state["current_figure"]
+        old_control.value = "Overview"
+        self.assertIs(state["current_figure"], figure)
+        # Only two dashboard roots (initial + intentional cell rerun), no Figures.
+        self.assertEqual(show.call_count, 2)
+        self.assertTrue(all(isinstance(call.args[0], state["widgets"].VBox) for call in show.call_args_list))
 
     def test_representative_issuers_lead_large_dropdown_without_dropping_small_ones(self):
         rows, securities = [], []
