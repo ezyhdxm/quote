@@ -3,6 +3,7 @@ import contextlib
 import io
 from pathlib import Path
 import unittest
+import tempfile
 from unittest.mock import patch
 import numpy as np
 import pandas as pd
@@ -151,6 +152,28 @@ class Step3Checks(unittest.TestCase):
         self.assertTrue(pd.isna(f.iloc[1]['center_max_age']))
         self.assertEqual(f.iloc[1]['center_decay'],15)
         self.assertEqual(f.iloc[1]['max_decay_weight_share'],0.5)
+        self.assertEqual(f.iloc[1]['decay_effective_dealers'],2)
+
+    def test_candidate_clipping_is_visible_even_if_center_does_not_change(self):
+        e=self.events([(0,'A',-100,0),(0,'A',0,0),(0,'A',100,0),
+                       (0,'B',0,0),(0,'C',0,0),(0,'D',0,0)])
+        slots,f=self.snapshots(e,[0])
+        target=slots.loc[slots['firm'].eq('A')].iloc[0]
+        self.assertEqual(target['clipped_candidate_count'],2)
+        self.assertEqual(target['clipped_center'],0)
+        self.assertEqual(f.iloc[0]['n_clipped_dealers'],1)
+        self.assertEqual(f.iloc[0]['n_changed_centers'],0)
+        self.assertEqual(f.iloc[0]['center_lower'],-25)
+        self.assertEqual(f.iloc[0]['center_upper'],25)
+
+    def test_midpoint_and_bound_changes_do_not_claim_candidate_identity(self):
+        e=self.events([(0,'A',80,0),(0,'A',100,0),(1,'A',81,0),(1,'A',99,0),
+                       (2,'A',80,1),(2,'A',100,2)])
+        self.assertEqual(e.iloc[0]['center_nearest_gap'],10)
+        self.assertEqual(e.iloc[1]['guarded_delta'],0)
+        self.assertEqual(e.iloc[1]['lo_delta'],1)
+        self.assertEqual(e.iloc[1]['hi_delta'],-1)
+        self.assertTrue(pd.isna(e.iloc[2]['lo_delta']))
 
     def test_quantity_contrasts_require_complete_all_positive_unique_mapping(self):
         raw=raw_rows([(0,'A',10,1),(0,'A',20,2),(0,'A',20,2),
@@ -167,12 +190,19 @@ class Step3Checks(unittest.TestCase):
 
     def test_all_views_empty_case_and_rerun_have_one_image_no_table(self):
         state,display=load_dashboard()
+        self.assertEqual(state['step3_view'].value,state['ALL_VIEWS'])
         image_id=state['step3_image'].model_id
-        for view in state['VIEWS']:
+        for view in [state['ALL_VIEWS']] + state['VIEWS']:
             state['step3_view'].value=view
             self.assertEqual(state['step3_image'].model_id,image_id)
             self.assertTrue(state['step3_image'].value.tobytes().startswith(b'\x89PNG'))
-            self.assertEqual(len(state['step3_figure'].axes),3)
+            self.assertEqual(len(state['step3_figure'].axes),12 if view==state['ALL_VIEWS'] else 3)
+        state['step3_view'].value=state['VIEWS'][0]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(state['Figure'],'savefig',autospec=True) as save, patch.dict(state,{'Path':lambda p:Path(tmp)}):
+            state['save_step3']()
+            self.assertEqual(save.call_count,1)
+            self.assertEqual(len(save.call_args.args[0].axes),12)
+            self.assertIn('All_four',str(save.call_args.args[1]))
         old_view=state['step3_view']
         state['step3_issuer'].value='Gamma'  # Missing firm, no keyed events.
         self.assertTrue(state['step3_features'].empty)
@@ -184,6 +214,16 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(display.call_count,2)
         self.assertTrue(all(isinstance(call.args[0],state['widgets'].VBox) for call in display.call_args_list))
         self.assertEqual(plt.get_fignums(),[])
+
+    def test_unsupported_influence_is_unassessed_not_a_zero_impact_line(self):
+        records=[(0,'A',80,0),(0,'A',100,0),(0,'B',95,0),(5,'A',81,0),(5,'A',101,0)]
+        result=self.state['event_history'](raw_rows(records))
+        result['issuer']='Synthetic sparse peers'
+        result['slots'],result['features']=self.snapshots(result['events'],[0,5])
+        fig=self.state['research_figure'](result,'A','BOND_A','bid',result['events'].iloc[0]['day'],self.state['VIEWS'][3],'Zero',30)
+        self.assertEqual(len(fig.axes[1].lines),0)
+        self.assertIn('NOT ASSESSED',' '.join(t.get_text() for t in fig.axes[1].texts))
+        self.assertTrue(result['features']['center_candidate_clip'].equals(result['features']['center_equal']))
 
 
 if __name__ == '__main__':

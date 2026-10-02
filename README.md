@@ -6,12 +6,11 @@ BondCliQ parquet, three-month traded-bond universe and ET conversion as steps 1�
 The matching [quote_quality_step3.py](quote_quality_step3.py) has VS Code cells.
 Run from the existing project root containing `data/` and `data.py`.
 
-Choose **issuer → dealer / bond / side / ET day**, then switch between four questions.
+Choose **issuer → dealer / bond / side / ET day**. **All four** is the default: a single 2×2 dashboard with three small plots per section and one shared case header.
 Previously inspected issuers lead the dropdown when present; automatically ranked
 multi-spread, wide-gap, quantity and active comparison cases follow. Every issuer
 remains available. Case ranking is retrospective selection, not an online feature.
-Changing the question preserves the case. Every observed quantity condition can
-be selected in the Quantity view. **Save PNG** exports only the displayed chart.
+Optional detail layouts enlarge one section without changing the case. Every observed quantity condition remains selectable. **Save all 4 PNG** always exports the full dashboard, including when a detail layout is displayed. Send that PNG to share all settings and results together.
 
 | View | What it compares | Decision / feature use |
 |---|---|---|
@@ -23,8 +22,7 @@ be selected in the Quantity view. **Save PNG** exports only the displayed chart.
 Every chart includes observed counts, the rule being tested and the feature use.
 Raw observations are retained. No large DataFrames, smoothing, crossing cleanup,
 quote-ID inference or model training run here. Empty / unsupported references are
-labelled instead of treated as zero deviation. Figures use one PNG widget and
-cell reruns detach old callbacks.
+labelled instead of treated as zero deviation. Figures use one PNG widget and cell reruns detach old callbacks. All sections use the same time range. Quantity shows all conditions in separate colors when there are at most six; otherwise it shows all points as background and highlights the selected condition.
 
 ## Calculation choices to inspect before using the drafts
 
@@ -62,7 +60,7 @@ cell reruns detach old callbacks.
   One comparison clips each finite candidate to that reference interval, then
   takes its median; the other keeps the dealer center but weights it by
   `min(1, radius / abs(center − peer_median))`. Without enough peers both retain
-  the baseline. Raw records are untouched. Unknown size conditions can explain
+  the baseline numerically, while the impact chart leaves those comparisons blank and labels them **NOT ASSESSED** when none are available. Candidate changes and median changes are counted separately. Raw records are untouched. Unknown size conditions can explain
   apparent disagreement; these are uncalibrated alternatives, not corruption tests.
 - Quantity contrasts use complete all-positive events with at least two quantities
   and exactly one spread per quantity. The contrast subtracts the event's median
@@ -85,17 +83,17 @@ arbitrary query times for later integration. No private data is committed.
 | `dispersion_bps`, `mean_candidate_gap`, `multi_fraction` | Cross-dealer spread dispersion versus within-dealer candidate ambiguity; not posterior uncertainty |
 | `zero_quantity_fraction`, `unknown_quantity_fraction` | Shares of contributing dealers whose latest sets contain zero or missing/other quantity |
 | `median_message_age_min`, `median_change_age_min`, `unknown_change_age_fraction` | Age and its observation limitation; median change age uses only known ages |
-| `max_decay_weight_share` | Concentration of normalized age-decay contributions |
-| `n_peer_supported`, `n_clipped_dealers` | Coverage and impact of the illustrative clipping comparison |
+| `max_decay_weight_share`, `decay_effective_dealers` | Largest normalized age-decay weight, and effective N = (sum w)^2 / sum(w^2); these describe contribution concentration, not independent-source counts |
+| `center_lower`, `center_upper` | Dealer-equal mean of candidate minima / maxima; descriptive sensitivity bounds, not executable prices or uncertainty bands |
+| `n_peer_supported`, `n_clipped_dealers`, `n_changed_centers` | Supported dealer count, dealers with any clipped candidate, and dealers whose median changes; unsupported fallback is not evidence that a rule worked |
 | `center_delta_30m`, `composition_changed_30m` | Fixed 30-minute endpoint comparison, independent of query batch; delta is withheld if dealer roster, quantity support or candidate count changes, or history is unavailable |
 
-Per-event `center_delta`, `guarded_delta`, `condition_changed`, `observed_aba`,
+Per-event `center_nearest_gap` measures distance from the median to the nearest observed candidate. `lo_delta` and `hi_delta` compare candidate extrema under the same condition checks as `guarded_delta`; they do not track quote identities. Per-event `center_delta`, `guarded_delta`, `condition_changed`, `observed_aba`,
 `changes_30m`, `change_age_unknown` and `history_start` are in the event history.
 The fixed-horizon aggregate delta describes observed summaries, not matched quote
 identities; its ages and ambiguity must be considered with it.
 
-This implements the Step 3 research comparisons and feature draft. Actual data
-interpretation and out-of-time predictive validation remain pending your run.
+This implements the Step 3 research comparisons and feature draft. The revised dashboard distinguishes persistent multi-level ambiguity, supported quantity conditions, contribution changes, and insufficient peers. Out-of-time predictive validation remains pending; reviewed cases do not establish a generally valid cleaner.
 A more stable-looking line is not evidence that a rule improves the LGBM task.
 
 ---
