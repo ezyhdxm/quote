@@ -1,10 +1,39 @@
-# Research plan and progress
+# Data quality research — step 2
 
-See [QUALITY_RESEARCH_PLAN.md](QUALITY_RESEARCH_PLAN.md) for the current research order.
-Step 1's quantity overview has been reviewed for nine issuers and is complete for this round.
-**Next: same-dealer, same-timestamp, same-side duplicate and multi-spread analysis.**
-Remaining quantity questions are part of the next stages, rather than a new prerequisite.
-The plan is documentation; step 2 has not yet been implemented.
+Open [quote_quality_step2.ipynb](quote_quality_step2.ipynb) and run its **three code cells**.
+The matching [quote_quality_step2.py](quote_quality_step2.py) has VS Code cells.
+The loading cell includes the same TRACE cache / pipeline and BondCliQ parquet paths
+as step 1. Run from your existing project root containing `data/` and `data.py`.
+
+Select **issuer**, then **Overview** or **Case**:
+
+- **Overview:** dealer multi-spread rates, rates by quantity category, and the
+  full distribution of within-group spread ranges. Numerators and denominators
+  are labelled. Dealer pages change only the dealer panel.
+- **Case:** choose case type, dealer, bond, side and ET date. Select an event and
+  inspect raw spread and quantity points in a configurable same-day window.
+  Every eligible event is accessible through pages of 50; exact candidate
+  values paginate eight per figure.
+- **Save PNG:** export the displayed figure to `outputs/quote_quality_step2/`.
+  Detailed raw rows and group counts remain in `step2_result`; no large tables
+  are printed.
+
+A group is **dealer / bond / side / exact ET timestamp**, without time rounding.
+Multi-spread means at least two distinct finite spreads. Repeated content is
+counted across all loaded fields, without deleting rows. Nonfinite spread rows,
+incomplete groups and rows missing grouping keys are reported separately.
+Incomplete groups remain in the rate denominators; the multi-spread rate counts
+observed finite candidates and does not certify the other groups as clean.
+The day-balanced rate averages within-day group rates across
+dealer-bond-side-days; affected-day coverage measures days with any multi-spread.
+
+Quantity categories are mutually exclusive: missing/other first, then contains
+zero, then different/same positive values. Units and economic meaning remain
+unconfirmed. Missing/other quantity is not plotted at numeric zero.
+Spreads retain the confirmed units and multiplier; zero/negative values stay.
+No latest/median selection, quote-state reconstruction, expiry, outlier removal,
+crossing cleaning, smoothing or feature generation runs here.
+The notebook contains no private data or saved real-data outputs.
 
 ---
 
