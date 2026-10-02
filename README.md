@@ -1,3 +1,114 @@
+# Data quality research — steps 4 and 5
+
+Open `quote_quality_step4.ipynb` for same-dealer bid/ask pairing and
+`quote_quality_step5.ipynb` for the BondCliQ increment over the supplied BASE model.
+Each notebook has **three code cells**, includes the existing data loader, and displays
+all panels together in one image. `Save all PNG` exports the complete dashboard.
+Keep `quote_quality_core.py` beside the notebooks; matching `.py` files are included.
+Install the repository requirements and run from your project directory containing `data/`.
+No private data or executed notebook outputs are included in the repository.
+
+## Step 4: what can safely be described as a pair?
+
+The 3×2 dashboard shows raw candidates, signed candidate-gap ranges, crossing
+composition under three pairing policies, dealer coverage, timestamp mismatch,
+and midpoint sensitivity. Previously reviewed issuers are promoted, with no
+clean/dirty labels; supported two-sided bond/dealer/day cases are selected first.
+
+- `signed gap = bid spread - ask spread`: negative is crossed; zero is locked.
+- All candidate combinations are represented by their minimum/maximum gap:
+  **none**, **some**, or **all** crossing. The range is not a probability or confidence interval.
+- Compare fresh complete same-dealer pairs, exact-timestamp pairs, and pairs
+  sharing a positive raw quantity within a short timestamp gap. Zero quantities
+  do not establish a size match. Even positive-size matches may remain multi-valued.
+- Each dealer has one vote per research grid time (default 5 minutes plus endpoints).
+  The displayed `n` counts dealer-grid slots, not independent events or Cartesian pairs.
+  Policy samples overlap; a lower crossing fraction may simply reflect lost coverage.
+- Incomplete latest events block older values; no overnight carry or arbitrary
+  candidate selection to remove crossing. One-sided observations remain in the coverage funnel.
+- Default age limit is 30 minutes and positive-size timestamp gap is 1 minute.
+  Controls allow 10/30/60 and 0/1/5, respectively. These are research choices.
+
+`step4_result['pairs']` and `['features']` retain detailed results without printing tables.
+Midpoints and signed gaps are observations under a pairing convention, not executable prices.
+The notebook deliberately does not synthesize cross-dealer best bid/ask markets.
+
+## Step 5: fixed existing target and baseline
+
+The exact **14 BASE_FEATURES** from the supplied training code are required in
+`data_ig`; missing columns raise a clear error. Categorical columns remain
+`PREV_TRADE_TYPE` and `TRADE_TYPE`. Every version predicts `D_BM_SPREAD`, adds
+`PREV_BM_SPREAD`, and scores against `BM_SPREAD` with errors multiplied by 100 to bps.
+BondCliQ spreads are already bps, so quote-to-anchor gaps subtract
+`100 * PREV_BM_SPREAD`. BASE columns are reused, not recomputed.
+
+DART/MAE, 400 trees, learning rate 0.2 and the supplied remaining model parameters
+are retained, with a common fixed seed of 2026. No EXTENDED, EFF_SIDE, sector/session
+or adaptive-anchor feature sets are included.
+
+| Version | Direct comparison and purpose |
+| --- | --- |
+| Base | Existing 14 features on the common target rows |
+| Quote levels | Add bid/ask gaps to the previous anchor and coverage counts |
+| Reliability | Add candidate ambiguity, peer dispersion, ages, quantity unknowns and support |
+| Age decay | Replace only quote levels with age-weighted levels; half-life 30 min |
+| Max age | Replace levels and availability/counts with <=30 min observations |
+| Candidate clip | Limit candidate influence using eligible other dealers |
+| Dealer downweight | Reduce a whole dealer's contribution using the same peer reference |
+| Paired | Add supported pair counts, gap/range, time mismatch and crossing descriptors |
+
+The last five versions compare against Reliability. Quote levels compares against
+Base; Reliability against Quote levels. Candidate medians are computed within each
+dealer, then dealer centers are equally weighted. Duplicate rows/candidate counts
+never give a dealer extra baseline votes. Raw candidates are preserved.
+Clipping uses at least three other fresh dealers and radius
+`max(10 bps, 4 * 1.4826 * peer MAD)`. Insufficient support falls back numerically;
+its effect is **unassessed**, not counted as evidence of zero impact.
+Quantity-conditioned price curves and guarded momentum are deferred: same raw size
+can still be multi-valued, while size-state switching can unnecessarily suppress changes.
+
+### Time alignment and a short-file pilot
+
+Feature queries use each trade's exact timestamp, not the plotting grid.
+Event time is known time; `ALLOW_EXACT_QUOTES=True` includes the entire same-time
+candidate group. Set it to `False` for strict-before sensitivity. Latest incomplete
+records block earlier values; no overnight carry. Unsupported metrics remain missing
+and coverage counts remain zero. Every version uses the same valid target population,
+including trades without quotes. A stable row ID prevents timestamp join expansion.
+
+The original 60/10/10 walk-forward window can leave little quote overlap with a
+one-month quote file. This notebook explicitly uses a **new pilot split**, ending
+on the final quote date: final 5 trade dates test, preceding 5 validation, earlier
+history training with a 2-date embargo before validation and at least 10 training
+dates. Thus its Base error is not directly comparable to the older screenshot's score.
+Actual quote coverage in each split is shown before training. Empty quote support
+in training/evaluation raises an unassessed message. No price errors are used to choose dates.
+
+1. Run the three cells: one-issuer preview shows coverage and rule effects.
+2. `Build all features` constructs the full experiment, including no-quote trades.
+3. `Run validation` compares all eight versions. The four panels show MAE, daily loss
+   differences, same-row coverage/type/par-quantity subgroups and pooled P95 error.
+4. Choose using validation; `Run locked test` refits Base, the direct comparator
+   and the chosen version on pre-test history with the same 2-date embargo. The
+   selection is locked in the current session. Re-running the entire experiment
+   does not make an already inspected test period unseen.
+5. `Export features` saves the feature frame, available predictions and an experiment
+   manifest under `outputs/quote_quality_step5/`; `Save all PNG` shares the current four panels.
+
+Issuer selection affects preview only; training always uses all issuers. Five test
+dates support a pilot assessment, not a final stability claim. There is no claim that
+any cleaner improves the real task until these notebooks are run on the actual data.
+
+### Validation
+
+`python -m unittest discover -s tests -p 'test_quality_step45.py' -v` checks crossing
+sign/set classes, unknown and multi-valued sizes, incomplete latest observations,
+chronology, duplicate/query invariance, no overnight carry, agreement with Step 3,
+unchanged target/anchor/BASE semantics, actual LightGBM training, widgets, locked-test
+flow and Parquet export on synthetic data. Both `.ipynb` files were also executed
+sequentially with inline plotting; combined figures and reruns produce no duplicate
+figures or large table outputs. Private data and full-scale real training were not available here.
+
 # Data quality research — step 3
 
 Open [quote_quality_step3.ipynb](quote_quality_step3.ipynb) and run its **three code cells**.

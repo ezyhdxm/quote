@@ -6,3 +6,4 @@ nbformat>=5.9
 pyarrow>=12
 ipywidgets>=8
 matplotlib>=3.7
+lightgbm>=4.0
