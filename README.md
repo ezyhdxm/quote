@@ -1,3 +1,13 @@
+# Research plan and progress
+
+See [QUALITY_RESEARCH_PLAN.md](QUALITY_RESEARCH_PLAN.md) for the current research order.
+Step 1's quantity overview has been reviewed for nine issuers and is complete for this round.
+**Next: same-dealer, same-timestamp, same-side duplicate and multi-spread analysis.**
+Remaining quantity questions are part of the next stages, rather than a new prerequisite.
+The plan is documentation; step 2 has not yet been implemented.
+
+---
+
 # Data quality research — step 1
 
 Open [quote_quality_step1.ipynb](quote_quality_step1.ipynb) and run its **three code cells**.
