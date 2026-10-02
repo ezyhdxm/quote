@@ -60,15 +60,18 @@ KEYS = ["firm", "cusip", "side", "quote_timestamp_ET"]
 QKINDS = ["Same positive", "Different positive", "Contains zero", "Missing / other"]
 QCOLORS = ["#287D8E", "#7656A8", "#D98B20", "#A25367"]
 DEALERS_PER_PAGE = 8
+REP_MIN_GROUPS = 100
+REP_MIN_DAYS = 2
+REP_MIN_MULTI = 5
+REP_PER_THEME = 2
+REP_MAX_CONTROL_RATE = 0.01
 issuer_labels = bcq_df["ISSUER"].astype("string").fillna("[Missing issuer]")
 
-def analyze_issuer(issuer):
-    raw = bcq_df.loc[issuer_labels.eq(issuer)].copy()
-    q = raw[KEYS + ["spread", "quantity"]].copy()
-    valid_key = q[KEYS].notna().all(axis=1)
-    for column in KEYS[:-1]:
+def group_quotes(raw, keys=KEYS, count_repeats=True):
+    q = raw[keys + ["spread", "quantity"]].copy()
+    valid_key = q[keys].notna().all(axis=1)
+    for column in keys[:-1]:
         valid_key &= q[column].astype("string").str.strip().ne("").fillna(False)
-    duplicate = raw.duplicated()  # All original loaded fields, not just spread/size.
     spread = pd.to_numeric(q["spread"], errors="coerce").to_numpy(float, na_value=np.nan)
     quantity = pd.to_numeric(q["quantity"], errors="coerce").to_numpy(float, na_value=np.nan)
     q["s"] = np.where(np.isfinite(spread), spread, np.nan)
@@ -82,8 +85,10 @@ def analyze_issuer(issuer):
     q["zero"] = q["qkind"].eq("Zero")
     q["unknown"] = q["qkind"].isin(["Missing", "Other"])
     q["bad_spread"] = q["s"].isna()
-    q["duplicate"] = duplicate.to_numpy()
-    groups = q.loc[valid_key].groupby(KEYS, sort=False, observed=True).agg(
+    # Ranking needs only narrow group statistics; exact content repeats are
+    # checked across every loaded field only for the selected issuer.
+    q["duplicate"] = raw.duplicated().to_numpy() if count_repeats else False
+    groups = q.loc[valid_key].groupby(keys, sort=False, observed=True).agg(
         rows=("s", "size"), repeats=("duplicate", "sum"),
         n_spreads=("s", "nunique"), lo=("s", "min"), hi=("s", "max"),
         n_quantity=("positive_q", "nunique"), has_zero=("zero", "any"),
@@ -97,12 +102,66 @@ def analyze_issuer(issuer):
         [QKINDS[3], QKINDS[2], QKINDS[1]], default=QKINDS[0],
     )
     groups["day"] = groups["quote_timestamp_ET"].dt.normalize()
+    return {"quotes": q.loc[valid_key] if count_repeats else None, "groups": groups,
+            "unkeyed_rows": int((~valid_key).sum()), "repeated_rows": int(q["duplicate"].sum()),
+            "bad_spread_rows": int(q["bad_spread"].sum())}
+
+def analyze_issuer(issuer):
+    raw = bcq_df.loc[issuer_labels.eq(issuer)].copy()
+    result = group_quotes(raw)
+    groups = result["groups"]
     daily = groups.groupby(KEYS[:3] + ["day"], observed=True)["multi"].agg(["mean", "max"])
-    return {"issuer": issuer, "raw": raw, "quotes": q.loc[valid_key], "groups": groups,
-            "unkeyed_rows": int((~valid_key).sum()), "repeated_rows": int(duplicate.sum()),
-            "bad_spread_rows": int(q["bad_spread"].sum()),
-            "day_balanced_rate": daily["mean"].mean(), "affected_day_rate": daily["max"].mean(),
-            "day_count": len(daily)}
+    result.update(issuer=issuer, raw=raw, day_balanced_rate=daily["mean"].mean(),
+                  affected_day_rate=daily["max"].mean(), day_count=len(daily))
+    return result
+
+def representative_issuers():
+    # One vectorized pass, not 1,700 full dashboard runs. Discard global quote
+    # details after constructing the small issuer summary; keep every issuer.
+    narrow = bcq_df[KEYS + ["spread", "quantity"]].assign(issuer=issuer_labels.to_numpy())
+    g = group_quotes(narrow, ["issuer"] + KEYS, count_repeats=False)["groups"]
+    g["incomplete"] = g["bad_spreads"].gt(0)
+    for category, column in zip(QKINDS, ["same_multi", "different_multi", "zero_multi", "unknown_multi"]):
+        g[column] = g["multi"] & g["qclass"].eq(category)
+    summary = g.groupby("issuer", observed=True).agg(
+        groups=("multi", "size"), multi=("multi", "sum"), dealers=("firm", "nunique"),
+        days=("day", "nunique"), bonds=("cusip", "nunique"), incomplete=("incomplete", "sum"),
+        same_multi=("same_multi", "sum"), different_multi=("different_multi", "sum"),
+        zero_multi=("zero_multi", "sum"), unknown_multi=("unknown_multi", "sum"),
+    ).reindex(sorted(issuer_labels.unique()), fill_value=0)
+    daily = g.groupby(["issuer"] + KEYS[:3] + ["day"], observed=True)["multi"].agg(["mean", "max"])
+    summary["balanced_rate"] = daily["mean"].groupby(level="issuer").mean()
+    summary["affected_days"] = daily["max"].groupby(level="issuer").mean()
+    summary["range_p90"] = g.loc[g["multi"]].groupby("issuer")["range_bps"].quantile(0.9)
+    supported = (summary["groups"].ge(REP_MIN_GROUPS) & summary["days"].ge(REP_MIN_DAYS)
+                 & summary["dealers"].ge(2))
+    fallback = not supported.any()
+    pool = summary.loc[supported if not fallback else summary["groups"].gt(0)]
+    min_multi = 1 if fallback else REP_MIN_MULTI
+    multi_pool = pool.loc[pool["multi"].ge(min_multi)]
+    themes = [
+        ("Broad multi", multi_pool, "affected_days", False),
+        ("Wide multi", multi_pool, "range_p90", False),
+    ]
+    for tag, column in [("Different quantity", "different_multi"), ("Zero quantity", "zero_multi"),
+                        ("Same quantity", "same_multi"), ("Unknown quantity", "unknown_multi")]:
+        candidates = multi_pool.loc[multi_pool[column].ge(min_multi)].copy()
+        candidates["theme_share"] = candidates[column] / candidates["multi"]
+        themes.append((tag, candidates, "theme_share", False))
+    themes.append(("Active control", pool.loc[pool["incomplete"].eq(0) & pool["balanced_rate"].le(REP_MAX_CONTROL_RATE)], "balanced_rate", True))
+    rankings = [(tag, candidates.sort_values([metric, "groups"], ascending=[ascending, False], kind="stable").index)
+                for tag, candidates, metric, ascending in themes]
+    promoted = {}
+    for _ in range(REP_PER_THEME):  # Interleave themes; avoid duplicate issuers.
+        for tag, order in rankings:
+            next_issuer = next((issuer for issuer in order if issuer not in promoted), None)
+            if next_issuer is not None:
+                promoted[next_issuer] = tag + ("; limited sample" if fallback else "")
+    order = list(promoted) + [issuer for issuer in summary.index if issuer not in promoted]
+    options = [(f"[{promoted[issuer]}] {issuer} | multi={int(summary.loc[issuer, 'multi']):,}/{int(summary.loc[issuer, 'groups']):,}"
+                if issuer in promoted else issuer, issuer) for issuer in order]
+    summary["front_reason"] = pd.Series(promoted)
+    return options, summary
 
 def overview_figure(result, page=1):
     g = result["groups"]
@@ -209,9 +268,12 @@ def case_figure(result, event, minutes=15, value_page=1):
 # Dealer/bond/side/date are selectable. Events paginate 50 at a time;
 # every eligible event is accessible and overview statistics are never sampled.
 # Candidate values paginate eight per screenshot. All rows remain in step2_result.
+# Representative issuers lead the dropdown, interleaving supported multi-spread
+# patterns and active controls; the remaining issuers follow alphabetically.
 
 # %% 3. Dropdown controls and PNG export
-issuer_box = widgets.Dropdown(options=sorted(issuer_labels.unique()), description="Issuer:", layout=widgets.Layout(width="650px"))
+issuer_options, issuer_summary = representative_issuers()
+issuer_box = widgets.Dropdown(options=issuer_options, description="Issuer:", layout=widgets.Layout(width="850px"))
 if not issuer_box.options:
     raise ValueError("No quote rows remain in the supplied three-month traded-bond universe.")
 view_box = widgets.ToggleButtons(options=["Overview", "Case"], description="View:")

@@ -7,6 +7,22 @@ as step 1. Run from your existing project root containing `data/` and `data.py`.
 
 Select **issuer**, then **Overview** or **Case**:
 
+Representative issuers are automatically placed first. The labelled front section
+interleaves broad multi-spread coverage, wide candidate ranges, different / zero /
+same / unknown quantity cases, and active low-multi-spread controls (up to two
+distinct issuers per theme). Labels show the reason and multi-group count / total
+group count. All remaining issuers follow alphabetically; none are removed.
+
+Defaults require at least 100 keyed groups, two ET dates and two dealers; anomaly
+themes require at least five multi-spread groups. Controls have no incomplete
+spread groups and at most a 1% day-balanced multi-spread rate. If no issuer meets
+the support requirements, the fallback is explicitly labelled **limited sample**.
+These constants are at the start of cell 2. Ranking runs one vectorized pass over
+narrow quote fields, rather than running every issuer dashboard; selected-issuer
+plots are still built on demand. `issuer_summary` holds the ranking evidence
+without automatically printing a table. The front section is research case
+selection, not a random sample or a dealer/issuer quality score.
+
 - **Overview:** dealer multi-spread rates, rates by quantity category, and the
   full distribution of within-group spread ranges. Numerators and denominators
   are labelled. Dealer pages change only the dealer panel.

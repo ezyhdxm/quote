@@ -198,6 +198,64 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(incomplete["n_spreads"], 2)
         self.assertEqual(incomplete["bad_spreads"], 1)
 
+    def test_representative_issuers_lead_large_dropdown_without_dropping_small_ones(self):
+        rows, securities = [], []
+        base = pd.Timestamp("2026-03-02T15:00:00Z")
+        # Most issuers have only one group and must not dominate the front.
+        for i in range(1700):
+            name, cusip = f"A tiny {i:04}", f"T{i:04}"
+            securities.append((cusip, name))
+            rows.append((cusip, "A", "bid", base, 30, 0))
+        patterns = [("Z Broad", 80, 2, [5, 5]), ("Z Wide", 20, 100, [5, 5]),
+                    ("Z Different", 20, 5, [1, 5]), ("Z Zero", 20, 3, [0, 0]),
+                    ("Z Same", 20, 4, [5, 5]), ("Z Unknown", 20, 7, [None, 5]),
+                    ("Z Control", 0, 0, [5, 5]), ("Z Incomplete", 0, 0, [5, 5])]
+        for name, n_multi, width, sizes in patterns:
+            securities.append((name, name))
+            for i in range(100):
+                time = base + pd.Timedelta(days=i % 2, minutes=i)
+                spreads = [30, 30 + width] if i < n_multi else [30]
+                if name == "Z Incomplete":
+                    spreads = [np.nan]
+                for spread, size in zip(spreads, sizes):
+                    rows.append((name, "A" if i % 3 == 0 else "B", "bid", time, spread, size))
+        quotes = pd.DataFrame(rows, columns=["cusip", "firm", "side", "quote_timestamp_UTC", "spread", "quantity"])
+        quotes["quote_timestamp_UTC"] = quotes["quote_timestamp_UTC"].astype(str)
+        trades = pd.DataFrame(securities, columns=["CUSIP", "ISSUER"])
+        trades["EFFECTIVE_DATETIME_TS"] = pd.Timestamp("2026-01-02")
+        state, _ = load_dashboard(quotes, trades)
+        options = state["issuer_box"].options
+        first = options[:7]
+        self.assertEqual([name for label, name in first], [
+            "Z Broad", "Z Wide", "Z Different", "Z Zero", "Z Same", "Z Unknown", "Z Control",
+        ])
+        self.assertEqual(len(options), 1708)
+        self.assertEqual(len({name for label, name in options}), 1708)
+        self.assertEqual(state["issuer_box"].value, "Z Broad")
+        for label, name in first:
+            self.assertIn("multi=", label)
+            self.assertIn("[", label)
+        summary = state["issuer_summary"]
+        self.assertTrue(pd.isna(summary.loc["Z Incomplete", "front_reason"]))
+        self.assertTrue(pd.isna(summary.loc["A tiny 0000", "front_reason"]))
+        self.assertEqual(summary.loc["Z Different", "different_multi"], 20)
+        # Exact repeated rows cannot improve a group's rank or support count.
+        state["bcq_df"] = pd.concat([state["bcq_df"], state["bcq_df"].iloc[[0]]], ignore_index=True)
+        state["issuer_labels"] = state["bcq_df"]["ISSUER"].astype("string").fillna("[Missing issuer]")
+        repeated_options, repeated_summary = state["representative_issuers"]()
+        self.assertEqual(list(options), repeated_options)
+        pd.testing.assert_frame_equal(summary, repeated_summary)
+
+    def test_ranking_fallback_is_labelled_and_matches_selected_issuer_statistics(self):
+        state, _ = load_dashboard()
+        self.assertIn("limited sample", state["issuer_box"].options[0][0])
+        summary = state["issuer_summary"]
+        for issuer in ["Alpha", "Beta", "Gamma"]:
+            result = state["analyze_issuer"](issuer)
+            self.assertEqual(summary.loc[issuer, "groups"], len(result["groups"]))
+            self.assertEqual(summary.loc[issuer, "multi"], int(result["groups"]["multi"].sum()))
+        self.assertEqual(summary.loc["Gamma", "groups"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
