@@ -1,3 +1,105 @@
+# Data quality research — step 3
+
+Open [quote_quality_step3.ipynb](quote_quality_step3.ipynb) and run its **three code cells**.
+It is standalone: the loading cell includes the same TRACE cache / pipeline,
+BondCliQ parquet, three-month traded-bond universe and ET conversion as steps 1–2.
+The matching [quote_quality_step3.py](quote_quality_step3.py) has VS Code cells.
+Run from the existing project root containing `data/` and `data.py`.
+
+Choose **issuer → dealer / bond / side / ET day**, then switch between four questions.
+Previously inspected issuers lead the dropdown when present; automatically ranked
+multi-spread, wide-gap, quantity and active comparison cases follow. Every issuer
+remains available. Case ranking is retrospective selection, not an online feature.
+Changing the question preserves the case. Every observed quantity condition can
+be selected in the Quantity view. **Save PNG** exports only the displayed chart.
+
+| View | What it compares | Decision / feature use |
+|---|---|---|
+| Candidates | All raw candidates versus their distinct-spread median; adjacent changes with/without a quantity-support and candidate-count guard | Retain ambiguity; avoid treating a change in quote conditions as ordinary momentum |
+| Quantity | All raw points and one selected raw-size condition; within-size multi-spread counts; eligible within-event contrasts | Decide whether conditional aggregation has enough repeated support |
+| Age | Dealer-equal no-expiry mean, exponential age decay and a maximum-message-age filter | Compare level changes against lost coverage; retain message age and observed set-change age separately |
+| Influence | Dealer-equal aggregation, candidate clipping and dealer downweighting | Quantify how proposed influence control changes the result; never label the peer median as truth |
+
+Every chart includes observed counts, the rule being tested and the feature use.
+Raw observations are retained. No large DataFrames, smoothing, crossing cleanup,
+quote-ID inference or model training run here. Empty / unsupported references are
+labelled instead of treated as zero deviation. Figures use one PNG widget and
+cell reruns detach old callbacks.
+
+## Calculation choices to inspect before using the drafts
+
+- Events are `firm / cusip / side / exact timestamp`. Duplicate rows do not change
+  candidate sets or price weights. Zero and negative spreads remain; raw quantity
+  zero, missing and other states remain distinct. Positive quantity is never
+  converted to TRACE par or declared executable.
+- The event center is the median of **distinct finite spreads**, a descriptive
+  value that need not be a quoted candidate. Incomplete events are visible in
+  the research plots but do not enter numerical as-of aggregation. A later
+  incomplete event blocks that dealer's contribution; it does not silently
+  fall back to the preceding valid quote.
+- Adjacent changes are assessed only within an ET day, with two complete events
+  and a gap at most `HISTORY_GAP_MIN=60`. `guarded_delta` additionally requires the
+  same quantity-condition set and candidate count. This is a comparability
+  convention, not identification of the same quote. A/B/A is marked at the
+  **third** observed event; the earlier observations are never rewritten.
+- Change history starts unknown, not at age zero. The age remains missing until
+  an observed set change in a continuous complete history. Day boundaries,
+  long gaps and incomplete events restart this history; observed history length
+  is retained. `changes_30m` counts observed changes in **(t−30m, t]** within that
+  history segment, so a short history is not a fully observed 30-minute window.
+- `asof_features(events, times, age_min=30)` expects one bond/side and aware query
+  times. It uses the latest event at or before each query, only within the same
+  ET day. Equal-time events are processed as one atomic quote set. Taking the
+  latest observed set is a feature convention; it does not infer withdrawal of
+  candidates omitted from the next event.
+- Baseline aggregation gives one total vote per dealer: mean of dealer event
+  centers. Message volume and candidate multiplicity cannot increase a dealer's
+  total vote. The exploratory Age setting (10/30/60 minutes) is both the
+  message-age half-life and the maximum-age hypothesis, in separate comparisons.
+- Influence references exclude the target dealer, require at least three other
+  complete dealer observations within the selected age limit, and use their
+  center median. The illustrative radius is `max(10 bps, 4 × 1.4826 × peer MAD)`.
+  One comparison clips each finite candidate to that reference interval, then
+  takes its median; the other keeps the dealer center but weights it by
+  `min(1, radius / abs(center − peer_median))`. Without enough peers both retain
+  the baseline. Raw records are untouched. Unknown size conditions can explain
+  apparent disagreement; these are uncalibrated alternatives, not corruption tests.
+- Quantity contrasts use complete all-positive events with at least two quantities
+  and exactly one spread per quantity. The contrast subtracts the event's median
+  across those quantities. Quantity graphs summarize the selected day and are
+  **diagnostics**, not features computed with future information.
+
+## Background results — no automatic table output
+
+`step3_result` retains raw rows, event histories, selected bond/side as-of dealer
+slots and comparison features. `step3_features` contains the current bond/side
+research case on a five-minute query grid plus its first/last observed timestamps;
+it is not an all-bond trade-level feature export. `asof_features` also accepts
+arbitrary query times for later integration. No private data is committed.
+
+| Draft columns / group | Meaning |
+|---|---|
+| `center_equal`, `center_decay`, `center_max_age` | No-expiry, message-age-weighted and age-limited mean dealer centers, in bps |
+| `center_candidate_clip`, `center_dealer_downweight` | Two counterfactual influence-control aggregates, in bps |
+| `n_dealers`, `n_fresh_dealers`, `n_incomplete` | Complete, age-eligible and incomplete latest dealer observations |
+| `dispersion_bps`, `mean_candidate_gap`, `multi_fraction` | Cross-dealer spread dispersion versus within-dealer candidate ambiguity; not posterior uncertainty |
+| `zero_quantity_fraction`, `unknown_quantity_fraction` | Shares of contributing dealers whose latest sets contain zero or missing/other quantity |
+| `median_message_age_min`, `median_change_age_min`, `unknown_change_age_fraction` | Age and its observation limitation; median change age uses only known ages |
+| `max_decay_weight_share` | Concentration of normalized age-decay contributions |
+| `n_peer_supported`, `n_clipped_dealers` | Coverage and impact of the illustrative clipping comparison |
+| `center_delta_30m`, `composition_changed_30m` | Fixed 30-minute endpoint comparison, independent of query batch; delta is withheld if dealer roster, quantity support or candidate count changes, or history is unavailable |
+
+Per-event `center_delta`, `guarded_delta`, `condition_changed`, `observed_aba`,
+`changes_30m`, `change_age_unknown` and `history_start` are in the event history.
+The fixed-horizon aggregate delta describes observed summaries, not matched quote
+identities; its ages and ambiguity must be considered with it.
+
+This implements the Step 3 research comparisons and feature draft. Actual data
+interpretation and out-of-time predictive validation remain pending your run.
+A more stable-looking line is not evidence that a rule improves the LGBM task.
+
+---
+
 # Data quality research — step 2
 
 Open [quote_quality_step2.ipynb](quote_quality_step2.ipynb) and run its **three code cells**.
