@@ -378,17 +378,23 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
     the local notebook must choose it from that bond/day's existing source state.
     An existing manifest is kept, never silently replaced. Cases are not rates.
     """
-    # CACHEING LOGIC: STEP 1 — Preserve an existing in-memory or CSV manifest instead of resampling
+    # CACHEING LOGIC: Preserve an existing in-memory manifest instead of resampling.
     if existing is not None:
         return existing.copy()
+    # FILE IO LOGIC: Read an existing CSV without rewriting the frozen file.
     path = Path(manifest_path) if manifest_path is not None else None
     if path is not None and path.is_file():
         kept = pd.read_csv(path)
+        # CORE LOGIC: STEP 1 — Restore each frozen case date in New York time.
+        # Input: day=['2026-03-01T00:00:00-05:00','2026-03-20T00:00:00-04:00','2026-03-02'].
+        # Output: day=[2026-03-01 00:00-05:00,2026-03-20 00:00-04:00,2026-03-02 00:00-05:00], all America/New_York.
+        # Trick: Scalar parsing avoids mixed DST offsets producing object dtype; naive dates remain local wall time.
         if 'day' in kept:
-            kept['day'] = to_ny_datetime(kept.day)
+            kept['day'] = kept.day.map(lambda value: to_ny_datetime(pd.Series([value])).iloc[0])
+        # CACHEING LOGIC: Return the frozen identities and local provenance without resampling.
         kept.attrs['source'] = 'existing frozen manifest; not overwritten'
         return kept
-    # CORE LOGIC: STEP 1 — Validate completed query keys and measured impact uniqueness
+    # CORE LOGIC: STEP 2 — Validate completed query keys and measured impact uniqueness
     # Input: frame row_id=[7,7] with cusip/time columns; n_each=6
     # Output: ValueError for non-unique completed row IDs; no raw quotes or training are accessed
     if n_each < 1:
@@ -399,7 +405,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
     impact_required = {'cusip', 'side', 'day', 'max_center_effect_bps', 'coverage_loss_fraction'}
     if not impact_required.issubset(impacts):
         raise ValueError('Need saved trade-query impact keys and measured center / coverage effects')
-    # CORE LOGIC: STEP 2 — Prepare narrow saved query features and impact provenance
+    # CORE LOGIC: STEP 3 — Prepare narrow saved query features and impact provenance
     # Input: impacts=[(cusip=X,side=bid,day=Mar2 10:00 ET,max_center_effect_bps=2,coverage_loss_fraction=0.1)]; frame row=(row_id=7,cusip=X,time=Mar2 10:00 ET,bcq_bid_n_dealers=2)
     # Output: measured day=Mar2 00:00 ET; copied rows retain row_id=7,cusip=X,time and bcq_bid_n_dealers=2; extra model columns are not copied
     # Trick: Duplicate bond/side/day impacts fail before the join, preventing accidental multiplication of case rows.
@@ -412,21 +418,26 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
         for side in ['bid', 'ask'] for suffix in ['n_dealers', 'mean_candidate_gap', 'unknown_quantity_fraction']]
     rows = frame[[c for c in columns if c in frame]].copy()
     rows['day'] = to_ny_datetime(rows.time).dt.normalize()
-    # CORE LOGIC: STEP 3 — Limit navigation to the stated quote-file date interval
-    # Input: quote_start=Mar1, quote_end=Mar31; frame days=[Jan1,Mar2], cusips=['X','X']
-    # Output: only the Mar2 row enters candidates; metadata blanks become nulls
-    # Trick: This window bounds candidate navigation, not the three-month traded-bond universe.
+    # CORE LOGIC: STEP 4 — Validate the stated quote-file date interval.
+    # Input: quote_start='2026-03-01T00:00-05:00', quote_end='2026-04-01T00:00-04:00'.
+    # Output: start=2026-03-01 00:00-05:00, end=2026-04-01 00:00-04:00; malformed or reversed bounds reject.
+    # Trick: Parse bounds separately across DST; naive values remain New York wall time. This window only bounds navigation.
     start = quote_start if quote_start is not None else impacts.attrs.get('start', measured.day.min())
     end = quote_end if quote_end is not None else impacts.attrs.get('end', measured.day.max())
+    start = to_ny_datetime(pd.Series([start])).dt.normalize().iloc[0]
+    end = to_ny_datetime(pd.Series([end])).dt.normalize().iloc[0]
     if pd.isna(start) or pd.isna(end):
         raise ValueError('Need quote-file dates or a nonempty supplied impact window')
-    start, end = to_ny_datetime(pd.Series([start, end])).dt.normalize()
     if start > end:
         raise ValueError('Invalid quote-file window')
+    # CORE LOGIC: STEP 5 — Retain eligible navigation dates and normalize blank metadata.
+    # Input: rows=[(X,2026-01-01,ISSUER='A',SECTOR='Energy'),(X,2026-03-02,ISSUER=' ',SECTOR='Energy')]; window=Mar1-Apr1 ET.
+    # Output: rows=[(X,2026-03-02,ISSUER=NA,SECTOR='Energy')].
+    # Trick: A missing CUSIP cannot identify a local case; empty metadata stays missing until grouped display labels.
     rows = rows.loc[rows.day.between(start, end) & rows.cusip.notna()].copy()
     for col, missing in [('ISSUER', '[Missing issuer]'), ('SECTOR', 'Unknown')]:
         rows[col] = rows[col].astype('string').str.strip().replace('', pd.NA) if col in rows else pd.NA
-    # CORE LOGIC: STEP 4 — Create per-side known-support indicators from saved counts
+    # CORE LOGIC: STEP 6 — Create per-side known-support indicators from saved counts
     # Input: one bond/day has bid n_dealers=[0,2,None]
     # Output: quote_present=[0.0,1.0,NaN], support_known=[True,True,False], dealer_count=[0,2,NaN]
     parts = []
@@ -439,7 +450,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
         z['candidate_gap'] = _numeric(rows, f'bcq_{side}_mean_candidate_gap')
         z['unknown_quantity'] = _numeric(rows, f'bcq_{side}_unknown_quantity_fraction')
         g = z.groupby(['cusip', 'day'], observed=True, sort=True)
-        # CORE LOGIC: STEP 5 — Reduce trade-query support and resolve conflicting metadata
+        # CORE LOGIC: STEP 7 — Reduce trade-query support and resolve conflicting metadata
         # Input: X/Mar2 has quote_present=[0,1,NaN], issuer=['A','A','A'], sector=['Energy','Utilities',None]
         # Output: trade_queries=3, known_support_queries=2, quote_query_fraction=0.5, ISSUER='A', SECTOR='Conflicting'
         # Trick: Unknown counts do not enter the known-support mean; its denominator is reported separately from total queries.
@@ -452,7 +463,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
             c[col] = values.fillna(missing).mask(distinct.gt(1), conflict).to_numpy()
         c['side'] = side
         parts.append(c)
-    # CORE LOGIC: STEP 6 — Assign stable bond/side/day case IDs and measured effects
+    # CORE LOGIC: STEP 8 — Assign stable bond/side/day case IDs and measured effects
     # Input: X/bid/Mar2 has 3 saved eligible trade queries, seed=2026, one matching center-effect=2 bps impact
     # Output: activity='Sparse'; case_id='X|bid|2026-03-02T00:00:00-05:00'; hash=386cef0ea54386623fd4f439eb08442f0ef687ea79beeeafeb8ea651017b56fb; joined center-effect=2
     # Trick: Identities do not depend on source row order or validation errors.
@@ -461,7 +472,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
     candidates['case_id'] = ['|'.join([str(r.cusip), r.side, r.day.isoformat()]) for r in candidates.itertuples()]
     candidates['stable_hash'] = candidates.case_id.map(lambda key: sha256(f'{seed}|{key}'.encode()).hexdigest())
     candidates = candidates.merge(measured, on=['cusip', 'side', 'day'], how='left', validate='one_to_one')
-    # CORE LOGIC: STEP 7 — Rank typical cases by normalized distance to stratum medians
+    # CORE LOGIC: STEP 9 — Rank typical cases by normalized distance to stratum medians
     # Input: one stratum support metric=[0,0.5,1] and other metrics constant
     # Output: median broadcasts as [0.5,0.5,0.5]; scale=1; distance=[0.5,0,0.5]
     # Trick: transform keeps original row alignment; constant metric ranges become 1 and unavailable distances contribute 0.
@@ -507,7 +518,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
                     if len(selected) == n_each: break
                 if len(selected) == before: break
         return pool.loc[selected].copy()
-    # CORE LOGIC: STEP 8 — Freeze seeded random and within-stratum typical samples
+    # CORE LOGIC: STEP 10 — Freeze seeded random and within-stratum typical samples
     # Input: n_each=1; candidates has one row X/bid/Mar2 (SECTOR=Energy, activity=Sparse, quote_query_fraction=0, trade_queries=2, unknown_quantity_fraction=0)
     # Output: Random=[X/bid/Mar2]; Typical=[] because the only case ID is already used
     random = pick(candidates.sort_values('stable_hash'), [lambda x: x.quote_query_fraction.eq(0),
@@ -515,7 +526,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
     random['selection'] = 'Random'; random['selection_reason'] = 'seeded sector/activity strata; no-quote/sparse/unknown support included when available'
     typical = pick(candidates.sort_values(['typical_distance', 'stable_hash'], kind='stable'))
     typical['selection'] = 'Typical'; typical['selection_reason'] = 'nearest within-stratum median saved query support/ambiguity profile'
-    # CORE LOGIC: STEP 9 — Select high impact by actual center or coverage effects
+    # CORE LOGIC: STEP 11 — Select high impact by actual center or coverage effects
     # Input: n_each=2, used={A,D,E,F}; remaining quoted B and C have center_effect=[2,1], coverage_loss=[0.2,0.1], distinct issuers; A has quote_fraction=0
     # Output: High impact=[B,C] with impact_score=[2,1]; A excluded despite any recorded gap
     # Trick: Raw gap cannot qualify a high case, and a missing measured effect is not replaced with zero.
@@ -524,7 +535,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
     high['impact_score'] = high.max_center_effect_bps.rank(pct=True) + high.coverage_loss_fraction.rank(pct=True)
     high = pick(high.sort_values(['impact_score', 'stable_hash'], ascending=[False, True], kind='stable'))
     high['selection'] = 'High impact'; high['selection_reason'] = 'measured rule center / coverage effect on supplied queries'
-    # CORE LOGIC: STEP 10 — Record the navigation-only source and missing dealer identity
+    # CORE LOGIC: STEP 12 — Record the navigation-only source and missing dealer identity
     # Input: manifest contains 6 Random, 6 Typical, 2 High impact cases from supplied trade queries
     # Output: case_number=1..14; firm is NA; source columns identify aggregate-query support and navigation-only scope
     manifest = pd.concat([random, typical, high], ignore_index=True)
@@ -535,7 +546,7 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
     manifest['impact_source'] = source
     manifest['candidate_source'] = 'supplied eligible trade-query frame within stated window'
     manifest['scope_flag'] = 'navigation sample only; no population-rate claim'
-    # CORE LOGIC: STEP 11 — Report soft-cap relaxation and preserve window/provenance flags
+    # CORE LOGIC: STEP 13 — Report soft-cap relaxation and preserve window/provenance flags
     # Input: issuer A occurs 3 times; explicit quote dates Mar1-Mar31; seed=2026
     # Output: A cases issuer_cap_relaxed=True; window_source='explicit quote dates'; attrs population_rate=False
     # Trick: Neither sample counts nor query fractions should be presented as population event rates.
@@ -543,12 +554,12 @@ def fixed_trade_case_manifest(frame, impacts, n_each=6, existing=None, seed=2026
     manifest['window_start'], manifest['window_end'] = start, end
     manifest['window_source'] = 'explicit quote dates' if quote_start is not None and quote_end is not None else 'impact metadata or supplied impact-day range'
     manifest.attrs.update(seed=seed, source=source, population_rate=False, dealer_cap='not assessable without dealer-level state')
-    # FILE IO LOGIC: STEP 13 — Persist only a newly created manifest with exclusive file creation
+    # FILE IO LOGIC: Persist only a newly created manifest with exclusive file creation.
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('x', encoding='utf-8') as stream:
             manifest.to_csv(stream, index=False)
-    # CORE LOGIC: STEP 12 — Return the frozen navigation manifest
+    # CORE LOGIC: STEP 14 — Return the frozen navigation manifest
     # Input: manifest rows: (case_number=1,selection='Random',cusip='X',side='bid',day=Mar2,ISSUER='A',SECTOR='Energy',firm=NA)
     # Output: return the same one-row manifest after optional exclusive CSV export
     return manifest

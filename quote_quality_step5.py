@@ -638,6 +638,7 @@ if step5_saved_lock_guard:
 # Start with **Age decay → Review losses**, then **Review rule effects → Freeze cases**.
 # Next build movement features and inspect support before either one-model Fit.
 # Repeated execution keeps the existing research session, including added predictions.
+# The last cell reloads the lightweight saved-review/case helpers to apply fixes in place.
 # A fresh kernel can review saved validation; movement needs the original event cache
 # or a matching saved movement sidecar. Missing/corrupt results show a message.
 
@@ -653,6 +654,14 @@ if (globals().get('step5_busy', False) or globals().get('step5_research_busy', F
 # UI LOGIC: This cell is independent of the loader and original controls cells.
 from html import escape as step5_research_escape
 from IPython.display import display, HTML
+# SETUP LOGIC: Refresh review/case helpers only after the busy guard, without reloading core/cache/model code.
+# Trick: Existing research callbacks import these functions on each click; retained session objects need no rebuild.
+import importlib as step5_review_importlib
+import quote_quality_saved as step5_saved_review
+import quote_quality_diagnostics as step5_case_review
+step5_review_importlib.reload(step5_saved_review)
+step5_review_importlib.reload(step5_case_review)
+# UI LOGIC: Opening or redisplaying controls is explicit; imports do not run an analysis.
 from quote_quality_research import show_research
 # UI LOGIC: Preserve an existing session, including its sidecar and incremental predictions.
 try:

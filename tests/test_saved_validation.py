@@ -28,6 +28,21 @@ def fixture():
     return f, pd.concat(parts, ignore_index=True)
 
 
+# TEST FIXTURE LOGIC: Actual rule inputs span both DST offsets and include targets outside file dates.
+def rule_fixture():
+    import quote_quality_core as core
+    frame, _ = fixture()
+    frame['cusip'] = 'X'
+    frame['time'] = pd.DatetimeIndex(['2026-02-28 23:59', '2026-03-01 00:00',
+        '2026-03-07 23:59', '2026-03-08 03:01', '2026-03-31 23:59', '2026-04-02 00:00'],
+        tz='America/New_York')
+    quotes = pd.DataFrame([dict(cusip='X', firm='A', side='bid', spread=0., quantity=0,
+        quote_timestamp_ET=frame.time.iloc[1])])
+    features = core.build_quote_features(quotes, frame[['row_id', 'cusip', 'time']])
+    return frame.drop(columns=['bcq_has_quote', 'bcq_n_pair', 'bcq_n_size_time_pair']).merge(
+        features.drop(columns=['time', 'cusip']), on='row_id', validate='one_to_one')
+
+
 # TEST LOGIC: SavedValidationChecks；仅用于复现输入或核对行为。
 class SavedValidationChecks(unittest.TestCase):
     # TEST LOGIC: test_target_sector_and_identical_row_deltas；仅用于复现输入或核对行为。
@@ -105,6 +120,37 @@ class SavedValidationChecks(unittest.TestCase):
         self.assertGreater(int(result['summary'].n.sum()), int(result['summary'].quote_n.sum()))
         with tempfile.TemporaryDirectory() as temp:
             saved.trade_rule_figure(result).savefig(Path(temp) / 'rule_effects.png')
+
+    # TEST LOGIC: Both DST offsets retain exact NY dates; UTC endpoints convert, naive ones remain wall time.
+    def test_rule_dates_across_dst_preserve_naive_and_aware_endpoint_semantics(self):
+        frame = rule_fixture()
+        retained = frame.copy(deep=True)
+        endpoints = [
+            ('2026-03-01T00:00:00-05:00', '2026-04-01T23:59:00-04:00'),
+            (pd.Timestamp('2026-03-01T00:00:00-05:00'), pd.Timestamp('2026-04-01T23:59:00-04:00')),
+            ('2026-03-01 00:30:00', '2026-04-01 23:59:00'),
+            ('2026-03-02T03:00:00Z', '2026-04-02T03:59:00Z'),
+            ('2026-03-01 00:30:00', '2026-04-01T23:59:00-04:00')]
+        for start, end in endpoints:
+            with self.subTest(start=start, end=end):
+                result = saved.trade_rule_diagnostics(frame, start, end)
+                self.assertEqual(result['start'], pd.Timestamp('2026-03-01', tz='America/New_York'))
+                self.assertEqual(result['end'], pd.Timestamp('2026-04-01', tz='America/New_York'))
+                self.assertEqual(result['n'], 4)
+                self.assertEqual(result['outside_file_date_n'], 2)
+                self.assertEqual(result['summary'].n.sum(), 4)
+                # TEST LOGIC: The sole zero-spread quote remains valid; three later no-quote days stay in n.
+                self.assertEqual(result['summary'].quote_n.sum(), 1)
+        pd.testing.assert_frame_equal(frame, retained)
+
+    # TEST LOGIC: Invalid or reversed bounds still fail before sector aggregation or plotting.
+    def test_rule_dates_reject_invalid_and_reversed_bounds(self):
+        frame = rule_fixture()
+        for start, end in [('bad', '2026-04-01'), ('2026-03-01', None),
+                           ('2026-04-01T00:00-04:00', '2026-03-01T00:00-05:00')]:
+            with self.subTest(start=start, end=end):
+                with self.assertRaisesRegex(ValueError, 'actual quote file start and end'):
+                    saved.trade_rule_diagnostics(frame, start, end)
 
 
 # TEST LOGIC: Step5CheckpointChecks；仅用于复现输入或核对行为。

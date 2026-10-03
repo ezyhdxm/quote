@@ -197,6 +197,63 @@ class ResearchDiagnosticsChecks(unittest.TestCase):
 
 # TEST LOGIC: FrozenTradeCaseChecks；仅用于复现输入或核对行为。
 class FrozenTradeCaseChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: Two real ET dates span the March DST offset transition.
+    def dst_fixture(self):
+        frame, _ = fixture()
+        frame = frame.loc[frame.row_id.isin([0, 1])].copy()
+        frame['time'] = pd.to_datetime(['2026-03-01T10:00:00-05:00',
+                                       '2026-03-20T10:00:00-04:00'], utc=True).tz_convert('America/New_York')
+        return frame, impacts_fixture(frame)
+
+    # TEST LOGIC: Creating/restoring frozen cases across DST retains exact case identities and immutable CSV bytes.
+    def test_dst_manifest_csv_roundtrip_retains_local_days_and_frozen_file(self):
+        frame, impacts = self.dst_fixture()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'cases.csv'
+            created = review.fixed_trade_case_manifest(frame, impacts, n_each=2, manifest_path=path,
+                quote_start='2026-03-01T00:00:00-05:00', quote_end='2026-04-01T00:00:00-04:00')
+            before = path.read_bytes()
+            with (patch('quote_quality_core.prepare_quote_events', side_effect=AssertionError('no event rebuild')),
+                  patch('quote_quality_core.run_comparison', side_effect=AssertionError('no model fit'))):
+                restored = review.fixed_trade_case_manifest(frame, impacts, manifest_path=path)
+            self.assertEqual(set(created.day.dt.strftime('%Y-%m-%d')), {'2026-03-01', '2026-03-20'})
+            self.assertEqual(created.case_id.tolist(), restored.case_id.tolist())
+            pd.testing.assert_series_equal(created.day, restored.day)
+            self.assertEqual(path.read_bytes(), before)
+
+    # TEST LOGIC: A legacy naive local date must not shift to the previous ET day when aware DST strings coexist.
+    def test_mixed_aware_and_naive_frozen_csv_dates_preserve_wall_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'cases.csv'
+            pd.DataFrame({'case_id': ['A', 'B', 'C'], 'day': ['2026-03-01T00:00:00-05:00',
+                '2026-03-20T00:00:00-04:00', '2026-03-02']}).to_csv(path, index=False)
+            before = path.read_bytes()
+            restored = review.fixed_trade_case_manifest(None, None, manifest_path=path)
+            expected = pd.Series(pd.DatetimeIndex(['2026-03-01', '2026-03-20', '2026-03-02'],
+                                                 tz='America/New_York'), name='day')
+            pd.testing.assert_series_equal(restored.day, expected)
+            self.assertEqual(path.read_bytes(), before)
+
+    # TEST LOGIC: Scalar range parsing supports ISO offsets, timestamp objects, local naive values and UTC ET-date boundaries.
+    def test_dst_case_window_bounds_preserve_new_york_dates(self):
+        frame, impacts = self.dst_fixture()
+        cases = [
+            ('2026-03-01T00:00:00-05:00', '2026-04-01T00:00:00-04:00', '2026-04-01'),
+            (pd.Timestamp('2026-03-01T00:00:00-05:00'), pd.Timestamp('2026-04-01T00:00:00-04:00'), '2026-04-01'),
+            ('2026-03-01 00:30:00', '2026-03-20 23:59:00', '2026-03-20'),
+            ('2026-03-02T03:00:00Z', '2026-03-21T03:00:00Z', '2026-03-20'),
+        ]
+        for start, end, expected_end in cases:
+            with self.subTest(start=start, end=end):
+                result = review.fixed_trade_case_manifest(frame, impacts, n_each=2,
+                                                          quote_start=start, quote_end=end)
+                self.assertEqual(set(result.day.dt.strftime('%Y-%m-%d')), {'2026-03-01', '2026-03-20'})
+                self.assertTrue(result.window_start.eq(pd.Timestamp('2026-03-01', tz='America/New_York')).all())
+                self.assertTrue(result.window_end.eq(pd.Timestamp(expected_end, tz='America/New_York')).all())
+        for start, end in [('bad', '2026-04-01'), ('2026-04-01', '2026-03-01')]:
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                review.fixed_trade_case_manifest(frame, impacts, quote_start=start, quote_end=end)
+
     # TEST LOGIC: test_stable_cases_include_no_quote_and_do_not_access_quote_or_event_paths；仅用于复现输入或核对行为。
     def test_stable_cases_include_no_quote_and_do_not_access_quote_or_event_paths(self):
         frame, _ = fixture(); impacts = impacts_fixture(frame)

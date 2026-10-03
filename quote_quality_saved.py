@@ -411,10 +411,13 @@ def trade_rule_diagnostics(frame, quote_start, quote_end):
     # SETUP LOGIC: Use the shared ET conversion without changing source feature columns.
     from quote_quality_core import to_ny_datetime
     # CORE LOGIC: STEP 1 — Validate the predeclared quote file date range.
-    # Input: quote_start=2026-03-01 00:00 ET, quote_end=2026-04-01 23:59 ET; target at 2026-03-19 10:00 ET.
-    # Output: day=[2026-03-19 00:00 ET], start=03-01 00:00 ET, end=04-01 00:00 ET; reversed endpoints reject.
+    # Input: quote_start='2026-03-01T00:00-05:00', quote_end='2026-04-01T23:59-04:00'; target='2026-03-19T10:00-04:00'.
+    # Output: day=[2026-03-19 00:00-04:00], start=2026-03-01 00:00-05:00, end=2026-04-01 00:00-04:00, all America/New_York.
+    # Trick: Parse endpoints separately: mixed fixed offsets otherwise become object dtype or NaT across DST.
+    # Trick: The shared converter treats naive endpoints as NY wall time; utc=True would shift their local date.
     day = to_ny_datetime(frame.time).dt.normalize()
-    start, end = to_ny_datetime(pd.Series([quote_start, quote_end])).dt.normalize()
+    start = to_ny_datetime(pd.Series([quote_start])).dt.normalize().iloc[0]
+    end = to_ny_datetime(pd.Series([quote_end])).dt.normalize().iloc[0]
     if pd.isna(start) or pd.isna(end) or start > end:
         raise ValueError('Need actual quote file start and end timestamps')
     # CORE LOGIC: STEP 2 — Separate actual targets inside file dates and retain target sector/date.

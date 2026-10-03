@@ -240,10 +240,12 @@ class IntegratedResearchEntryChecks(unittest.TestCase):
 
     # TEST LOGIC: 磁盘不可读同样是可见错误，不能把故障解释成需要重训。
     def test_unreadable_checkpoint_shows_io_error_and_preserves_live_objects(self):
+        from quote_quality_saved import save_step5_checkpoint
         ns = self.live_namespace()
+        save_step5_checkpoint(ns['step5_frame'], ns['step5_predictions'])
         ns['step5_predictions'] = None
         frame = ns['step5_frame']
-        with patch('quote_quality_saved.load_saved_validation', side_effect=OSError('checkpoint disk unavailable')):
+        with patch.object(Path, 'read_text', side_effect=OSError('checkpoint disk unavailable')):
             display = self.execute_entry(ns)
         self.assertIs(ns['step5_frame'], frame)
         self.assertNotIn('step5_research', ns)
@@ -281,6 +283,39 @@ class IntegratedResearchEntryChecks(unittest.TestCase):
         self.assertIs(session.predictions, appended_predictions)
         self.assertEqual(session.status.value, 'Completed Direction; sidecar is still in memory')
         display.assert_called_once_with(session.dashboard)
+
+    # TEST LOGIC: Rerunning the written entry replaces stale helpers used by the same live session.
+    def test_rerun_refreshes_failed_rule_helper_without_resetting_existing_results(self):
+        import quote_quality_saved as saved
+        import quote_quality_core as core
+        ns = self.live_namespace()
+        frame = ns['step5_frame']
+        frame['cusip'] = 'X'
+        frame['SECTOR'] = 'Energy'
+        quotes = pd.DataFrame([dict(cusip='X', firm='A', side='bid', spread=-1., quantity=0,
+            quote_timestamp_ET=frame.time.iloc[0])])
+        features = core.build_quote_features(quotes, frame[['row_id', 'cusip', 'time']])
+        ns['step5_frame'] = frame.merge(features.drop(columns=['time', 'cusip']), on='row_id')
+        ns['step5_result_metadata']['quote_file_dates'] = [
+            '2026-03-01T00:00:00-05:00', '2026-04-01T23:59:00-04:00']
+        self.execute_entry(ns)
+        session = ns['step5_research']
+        session.sidecar = pd.DataFrame({'row_id': [0], 'movement': [2.]})
+        retained = {name: getattr(session, name) for name in ['frame', 'predictions', 'event_cache', 'sidecar']}
+        converter = core.to_ny_datetime
+        with patch.object(saved, 'trade_rule_diagnostics', side_effect=AttributeError('stale .dt helper')):
+            with self.assertRaisesRegex(AttributeError, 'stale .dt helper'):
+                session._rules()
+            self.assertIsNone(session.rule_review)
+            self.execute_entry(ns)
+            result = session._rules()
+        self.assertIs(ns['step5_research'], session)
+        self.assertIs(core.to_ny_datetime, converter)
+        for name, value in retained.items():
+            self.assertIs(getattr(session, name), value)
+        self.assertEqual(result['n'], 6)
+        self.assertEqual(result['start'], pd.Timestamp('2026-03-01', tz='America/New_York'))
+        self.assertEqual(result['end'], pd.Timestamp('2026-04-01', tz='America/New_York'))
 
     # TEST LOGIC: 已提交notebook自带末cell，和配对Python执行逻辑一致，无保存输出。
     def test_main_notebook_contains_the_same_independent_entry_cell(self):
