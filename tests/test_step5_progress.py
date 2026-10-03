@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Progress reporting must expose real work without changing feature or model results."""
 from importlib.util import find_spec
 from pathlib import Path
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import quote_quality_core as qc
 
 
+# TEST FIXTURE LOGIC: quotes；仅用于复现输入或核对行为。
 def quotes():
     start = pd.Timestamp('2026-03-02 10:00', tz='America/New_York')
     return pd.DataFrame([
@@ -23,11 +25,14 @@ def quotes():
     ])
 
 
+# TEST FIXTURE LOGIC: record_into；仅用于复现输入或核对行为。
 def record_into(events):
     return lambda stage, completed=None, total=None, detail='': events.append((stage, completed, total, detail))
 
 
+# TEST LOGIC: FeatureProgressChecks；仅用于复现输入或核对行为。
 class FeatureProgressChecks(unittest.TestCase):
+    # TEST LOGIC: test_history_and_empty_history_are_unchanged；仅用于复现输入或核对行为。
     def test_history_and_empty_history_are_unchanged(self):
         for raw in [quotes(), quotes().iloc[:0]]:
             reports = []
@@ -40,6 +45,7 @@ class FeatureProgressChecks(unittest.TestCase):
             self.assertTrue(all(r[1:3] == (None, None) for r in reports[:3]))
             self.assertEqual(reports[-1][1], reports[-1][2])
 
+    # TEST LOGIC: test_feature_progress_keeps_no_quote_queries_and_finishes_after_history；仅用于复现输入或核对行为。
     def test_feature_progress_keeps_no_quote_queries_and_finishes_after_history(self):
         q = quotes()
         queries = pd.DataFrame({'row_id': [9, 7, 5], 'cusip': ['X', 'MISSING', 'X'],
@@ -61,8 +67,10 @@ class FeatureProgressChecks(unittest.TestCase):
         self.assertEqual(empty_reports[0][:3], ('features', 0, 0))
 
 
+# TEST LOGIC: ModelProgressChecks；仅用于复现输入或核对行为。
 @unittest.skipUnless(find_spec('lightgbm'), 'LightGBM is required for real-fit progress checks')
 class ModelProgressChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: setUpClass；仅用于复现输入或核对行为。
     @classmethod
     def setUpClass(cls):
         q = quotes()
@@ -83,6 +91,7 @@ class ModelProgressChecks(unittest.TestCase):
                           num_leaves=4, min_child_samples=2, n_jobs=1,
                           verbosity=-1, random_state=2026)
 
+    # TEST LOGIC: test_callback_preserves_predictions_and_counts_real_iterations；仅用于复现输入或核对行为。
     def test_callback_preserves_predictions_and_counts_real_iterations(self):
         reports = []
         expected, _ = qc.run_comparison(self.frame, self.params)
@@ -102,6 +111,7 @@ class ModelProgressChecks(unittest.TestCase):
                 self.assertTrue(reports[index - 1][3].startswith('Predicting'))
                 self.assertEqual(reports[index - 1][1], event[1] - 1)
 
+    # TEST LOGIC: test_locked_test_counts_only_requested_versions_and_errors_do_not_finish；仅用于复现输入或核对行为。
     def test_locked_test_counts_only_requested_versions_and_errors_do_not_finish(self):
         reports = []
         expected, _ = qc.run_comparison(self.frame, self.params, 'Test', 'Candidate clip')
@@ -113,6 +123,7 @@ class ModelProgressChecks(unittest.TestCase):
             qc.run_comparison(self.frame.iloc[:0], self.params, progress=record_into(failed))
         self.assertFalse(any(r[3].startswith('Finished') for r in failed))
 
+    # TEST LOGIC: test_finite_validation_versions_match_full_predictions_and_requested_order；仅用于复现输入或核对行为。
     def test_finite_validation_versions_match_full_predictions_and_requested_order(self):
         full, _ = qc.run_comparison(self.frame, self.params)
         versions = ['Age decay','Base','Reliability','Quote levels']
@@ -149,6 +160,7 @@ class ModelProgressChecks(unittest.TestCase):
         heldout_changed, _ = qc.run_comparison(changed, self.params, versions=versions)
         pd.testing.assert_frame_equal(observed, heldout_changed)
 
+    # TEST LOGIC: test_invalid_validation_versions_and_explicit_test_versions_fail_before_fit；仅用于复现输入或核对行为。
     def test_invalid_validation_versions_and_explicit_test_versions_fail_before_fit(self):
         with patch('lightgbm.LGBMRegressor.fit', side_effect=AssertionError('unexpected fit')):
             for versions, message in [([], 'nonempty'), (['Base','Base'], 'unique'),

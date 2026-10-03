@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Integration checks for the raw-quantity dashboard and included data loader."""
 import contextlib
 import io
@@ -22,6 +23,7 @@ CACHE = Path("data/pipeline/data_ig.parquet")
 QUOTES = Path("data/bondcliq/quotes_pretrade_260301_260401_Wells_quotes2.parquet")
 
 
+# TEST FIXTURE LOGIC: fixture；仅用于复现输入或核对行为。
 def fixture():
     """Include ambiguity and repeats without requiring any market data."""
     quantities = [1.0, 2.0, 0.0, -0.0, None, np.nan, pd.NA,
@@ -57,6 +59,7 @@ def fixture():
     return quotes, trades
 
 
+# TEST FIXTURE LOGIC: load_dashboard；仅用于复现输入或核对行为。
 def load_dashboard(quotes=None, trades=None, cached=True, issuer="Alpha"):
     """Execute all three cells with mock data reads and real widget callbacks."""
     default_quotes, default_trades = fixture()
@@ -68,9 +71,11 @@ def load_dashboard(quotes=None, trades=None, cached=True, issuer="Alpha"):
     data_module.load_merged_prints = loader
     read_paths = []
 
+    # TEST FIXTURE LOGIC: exists；仅用于复现输入或核对行为。
     def exists(path):
         return cached if path == CACHE else original_exists(path)
 
+    # TEST FIXTURE LOGIC: read_parquet；仅用于复现输入或核对行为。
     def read_parquet(path, *args, **kwargs):
         read_paths.append(path)
         if path == CACHE:
@@ -100,10 +105,13 @@ def load_dashboard(quotes=None, trades=None, cached=True, issuer="Alpha"):
     }
 
 
+# TEST LOGIC: QuantityStep1Checks；仅用于复现输入或核对行为。
 class QuantityStep1Checks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: tearDown；仅用于复现输入或核对行为。
     def tearDown(self):
         plt.close("all")
 
+    # TEST LOGIC: test_step1_never_builds_full_quote_history；仅用于复现输入或核对行为。
     def test_step1_never_builds_full_quote_history(self):
         with patch("quote_quality_core.event_history", side_effect=AssertionError("quantity needs no history")), \
                 patch("quote_quality_core.prepare_quote_events", side_effect=AssertionError("quantity needs no event cache")):
@@ -111,6 +119,7 @@ class QuantityStep1Checks(unittest.TestCase):
         self.assertEqual(state["quantity_result"]["scope"], "Global")
         self.assertIn("Ready", state["quantity_status"].value)
 
+    # TEST LOGIC: test_cells_two_and_three_reuse_loaded_frames_after_old_load_interrupt；仅用于复现输入或核对行为。
     def test_cells_two_and_three_reuse_loaded_frames_after_old_load_interrupt(self):
         quotes, trades = fixture()
         quotes["quote_timestamp_ET"] = pd.to_datetime(quotes.quote_timestamp_UTC, utc=True).dt.tz_convert("America/New_York")
@@ -132,6 +141,7 @@ from IPython.display import display, clear_output
         self.assertIs(namespace["data_ig"], trades)
         self.assertEqual(namespace["quantity_result"]["scope"], "Global")
 
+    # TEST LOGIC: test_raw_quantity_categories_are_exhaustive_and_do_not_infer_units；仅用于复现输入或核对行为。
     def test_raw_quantity_categories_are_exhaustive_and_do_not_infer_units(self):
         state, _ = load_dashboard()
         data = state["quantity_data"]
@@ -152,6 +162,7 @@ from IPython.display import display, clear_output
         self.assertAlmostEqual(sum(group[0].get_width() for group in bars), 100.0)
         self.assertAlmostEqual(bars[0][0].get_width(), 4 / 14 * 100)
 
+    # TEST LOGIC: test_no_deduplication_or_spread_cleaning_and_trade_universe_is_preserved；仅用于复现输入或核对行为。
     def test_no_deduplication_or_spread_cleaning_and_trade_universe_is_preserved(self):
         quotes, trades = fixture()
         state, _ = load_dashboard(quotes, trades)
@@ -166,6 +177,7 @@ from IPython.display import display, clear_output
         self.assertEqual(str(raw["quote_timestamp_ET"].dt.tz), "America/New_York")
         self.assertEqual(raw["quote_timestamp_ET"].iloc[0].hour, 10)
 
+    # TEST LOGIC: test_missing_identifiers_remain_visible_and_do_not_drop_denominator；仅用于复现输入或核对行为。
     def test_missing_identifiers_remain_visible_and_do_not_drop_denominator(self):
         state, _ = load_dashboard()
         self.assertIn("[Missing issuer]", state["issuer_box"].options)
@@ -176,6 +188,7 @@ from IPython.display import display, clear_output
         self.assertEqual(int(unknown["counts"].loc["[Missing dealer]", "Positive"]), 1)
         self.assertEqual(unknown["positive_values"].tolist(), [3.0])
 
+    # TEST LOGIC: test_paging_changes_only_left_panel_and_issuer_switch_resets_page；仅用于复现输入或核对行为。
     def test_paging_changes_only_left_panel_and_issuer_switch_resets_page(self):
         state, calls = load_dashboard()
         first = state["quantity_result"]
@@ -201,6 +214,7 @@ from IPython.display import display, clear_output
         for call in calls["display"].call_args_list:
             self.assertFalse(any(isinstance(arg, pd.DataFrame) for arg in call.args))
 
+    # TEST LOGIC: test_full_positive_range_histogram_handles_extremes_without_trimming；仅用于复现输入或核对行为。
     def test_full_positive_range_histogram_handles_extremes_without_trimming(self):
         quotes, trades = fixture()
         quantities = [10.0 ** exponent for exponent in range(-12, 13)]
@@ -215,6 +229,7 @@ from IPython.display import display, clear_output
         self.assertLessEqual(min(p.get_x() for p in axis.patches), -12)
         self.assertGreaterEqual(max(p.get_x() + p.get_width() for p in axis.patches), 12)
 
+    # TEST LOGIC: test_cache_load_uses_user_paths_without_calling_pipeline；仅用于复现输入或核对行为。
     def test_cache_load_uses_user_paths_without_calling_pipeline(self):
         state, calls = load_dashboard(cached=True)
         self.assertEqual(calls["read_paths"], [CACHE, QUOTES])
@@ -224,6 +239,7 @@ from IPython.display import display, clear_output
         self.assertEqual(state["BENCHMARK_CSV"],
                          Path("data/pipeline/DailyCloseUSTBenchmarks.csv_20260506"))
 
+    # TEST LOGIC: test_fallback_calls_user_loader_parameters_and_saves_ny_trade_timestamps；仅用于复现输入或核对行为。
     def test_fallback_calls_user_loader_parameters_and_saves_ny_trade_timestamps(self):
         state, calls = load_dashboard(cached=False)
         calls["loader"].assert_called_once_with(

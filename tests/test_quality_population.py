@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Population denominators, reproducible cases and measured rule sensitivity."""
 from pathlib import Path
 import unittest
@@ -15,6 +16,7 @@ from tests.test_quality_step1 import load_dashboard as load_step1
 from tests.test_quality_step2 import load_dashboard as load_step2
 
 
+# TEST FIXTURE LOGIC: fixture；仅用于复现输入或核对行为。
 def fixture():
     trades = pd.DataFrame({
         "CUSIP": ["A", "A", "B", "B", "C", "D", "D"],
@@ -40,12 +42,15 @@ def fixture():
     return trades, quotes
 
 
+# TEST LOGIC: PopulationChecks；仅用于复现输入或核对行为。
 class PopulationChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: setUp；仅用于复现输入或核对行为。
     def setUp(self):
         self.event_prepare_patch = patch("quote_quality_cache.prepare_quote_events", side_effect=prepare_quote_events)
         self.event_prepare_patch.start()
         self.addCleanup(self.event_prepare_patch.stop)
 
+    # TEST LOGIC: test_sector_one_nonnull_unknown_conflicting_and_no_quote_universe；仅用于复现输入或核对行为。
     def test_sector_one_nonnull_unknown_conflicting_and_no_quote_universe(self):
         trades, quotes = fixture()
         u = build_bond_universe(trades).set_index("cusip")
@@ -71,6 +76,7 @@ class PopulationChecks(unittest.TestCase):
         self.assertAlmostEqual(g.dealer_equal_multi_rate, (1 + 0) / 2)
         self.assertAlmostEqual(g.unit_equal_multi_rate, 1 / 3)
 
+    # TEST LOGIC: test_reused_events_and_missing_keys_are_not_relabelled_into_events；仅用于复现输入或核对行为。
     def test_reused_events_and_missing_keys_are_not_relabelled_into_events(self):
         trades, quotes = fixture()
         raw = quotes.loc[quotes.cusip.isin(trades.CUSIP)]
@@ -83,6 +89,7 @@ class PopulationChecks(unittest.TestCase):
         self.assertEqual(p["tables"]["Global"].loc["Global", "unkeyed_rows"], 1)
         self.assertEqual(scope_selection(p, "Issuer", "Gamma")["groups"].shape[0], 0)
 
+    # TEST LOGIC: test_entirely_no_quote_input_keeps_universe_and_empty_case_manifest；仅用于复现输入或核对行为。
     def test_entirely_no_quote_input_keeps_universe_and_empty_case_manifest(self):
         trades, quotes = fixture()
         p = population_tables(trades, quotes.iloc[:0])
@@ -98,6 +105,7 @@ class PopulationChecks(unittest.TestCase):
         state["freeze_cases"]()
         self.assertIsNone(state["fixed_case_box"].value)
 
+    # TEST LOGIC: test_actual_impact_uses_same_local_queries_and_preserves_zero_negative；仅用于复现输入或核对行为。
     def test_actual_impact_uses_same_local_queries_and_preserves_zero_negative(self):
         trades, quotes = fixture()
         quotes = quotes.iloc[[0]].copy()
@@ -121,6 +129,7 @@ class PopulationChecks(unittest.TestCase):
         self.assertGreater(r.peer_supported_queries, 0)
         self.assertEqual(p["raw"].spread.eq(0).sum(), 3)
 
+    # TEST LOGIC: test_frozen_cases_stable_hash_strata_and_no_invented_high_impact；仅用于复现输入或核对行为。
     def test_frozen_cases_stable_hash_strata_and_no_invented_high_impact(self):
         trades, rows = [], []
         base = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
@@ -153,6 +162,7 @@ class PopulationChecks(unittest.TestCase):
         self.assertTrue(high.max_center_effect_bps.gt(0).all())
         self.assertEqual(m3.case_id.nunique(), 18)
 
+    # TEST LOGIC: test_global_default_apply_and_issuer_drilldown_without_reaggregating；仅用于复现输入或核对行为。
     def test_global_default_apply_and_issuer_drilldown_without_reaggregating(self):
         for load, result_key, apply_name in [(load_step1, "quantity_result", "apply_quantity"),
                                              (load_step2, "step2_result", "apply_scope")]:
@@ -169,6 +179,7 @@ class PopulationChecks(unittest.TestCase):
             self.assertEqual(state[result_key]["scope"], "Issuer")
             self.assertIs(events, state["quality_population"]["events"])
 
+    # TEST LOGIC: test_fixed_case_opens_sparse_single_side_event；仅用于复现输入或核对行为。
     def test_fixed_case_opens_sparse_single_side_event(self):
         state, _ = load_step2(issuer=None)
         state["freeze_cases"]()

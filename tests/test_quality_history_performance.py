@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Exact rolling-change equivalence across contiguous history segments."""
 from pathlib import Path
 import sys
@@ -13,12 +14,14 @@ import quote_quality_core as qc
 T = pd.Timestamp('2026-03-02 10:00', tz='America/New_York')
 
 
+# TEST FIXTURE LOGIC: quotes；仅用于复现输入或核对行为。
 def quotes(records):
     return pd.DataFrame([dict(cusip=bond, firm=firm, side=side, spread=spread,
         quantity=quantity, quote_timestamp_ET=T+pd.Timedelta(minutes=minute))
         for minute, bond, firm, side, spread, quantity in records])
 
 
+# TEST FIXTURE LOGIC: reference_changes；仅用于复现输入或核对行为。
 def reference_changes(events):
     """The former pandas-indexed loop, retained only as an independent oracle."""
     result = pd.Series(0, index=events.index, dtype='int64', name='changes_30m')
@@ -31,12 +34,15 @@ def reference_changes(events):
     return result
 
 
+# TEST LOGIC: RollingHistoryChecks；仅用于复现输入或核对行为。
 class RollingHistoryChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: check_reference；仅用于复现输入或核对行为。
     def check_reference(self, raw):
         events = qc.prepare_quote_events(raw)['events']
         pd.testing.assert_series_equal(events.changes_30m, reference_changes(events))
         return events
 
+    # TEST LOGIC: test_strict_left_boundary_includes_current_change；仅用于复现输入或核对行为。
     def test_strict_left_boundary_includes_current_change(self):
         events = self.check_reference(quotes([
             (0,'X','A','bid',100,2),(5,'X','A','bid',101,2),
@@ -50,6 +56,7 @@ class RollingHistoryChecks(unittest.TestCase):
         nanosecond.loc[2,'quote_timestamp_ET'] -= pd.Timedelta(nanoseconds=1)
         self.assertEqual(self.check_reference(nanosecond).changes_30m.tolist(), [0,1,2])
 
+    # TEST LOGIC: test_series_side_day_incomplete_and_condition_boundaries；仅用于复现输入或核对行为。
     def test_series_side_day_incomplete_and_condition_boundaries(self):
         raw = quotes([
             (0,'X','A','bid',100,2),(5,'X','A','bid',101,2),
@@ -69,6 +76,7 @@ class RollingHistoryChecks(unittest.TestCase):
         self.assertTrue(singleton.changes_30m.eq(0).all())
         self.assertTrue(singleton.history_break.all())
 
+    # TEST LOGIC: test_empty_events_and_progress_finish_with_segment_count；仅用于复现输入或核对行为。
     def test_empty_events_and_progress_finish_with_segment_count(self):
         raw = quotes([(0,'X','A','bid',100,2)])
         reports = []
@@ -80,6 +88,7 @@ class RollingHistoryChecks(unittest.TestCase):
         qc.prepare_quote_events(raw, lambda *args: reports.append(args))
         self.assertEqual(reports[-1][:3], ('events',1,1))
 
+    # TEST LOGIC: test_twenty_thousand_single_event_segments；仅用于复现输入或核对行为。
     def test_twenty_thousand_single_event_segments(self):
         # High segment cardinality, unlike a dense single-series row-count fixture.
         size = 20_000

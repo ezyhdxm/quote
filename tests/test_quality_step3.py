@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Causal event/snapshot checks and the notebook's four research workflows."""
 import contextlib
 import io
@@ -14,11 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'quote_quality_step3.py'
 
 
+# TEST FIXTURE LOGIC: load_dashboard；仅用于复现输入或核对行为。
 def load_dashboard(quotes=None, trades=None):
     default_q, default_t = fixture()
     quotes = default_q if quotes is None else quotes
     trades = default_t if trades is None else trades
     state = {'__name__': 'step3_test'}
+    # TEST FIXTURE LOGIC: read；仅用于复现输入或核对行为。
     def read(path, *a, **k):
         return (trades if Path(path).name == 'data_ig.parquet' else quotes).copy(deep=True)
     with contextlib.redirect_stdout(io.StringIO()), patch('pandas.read_parquet', side_effect=read), \
@@ -27,25 +30,31 @@ def load_dashboard(quotes=None, trades=None):
     return state, display
 
 
+# TEST FIXTURE LOGIC: raw_rows；仅用于复现输入或核对行为。
 def raw_rows(records):
     """records = (minute, dealer, spread, quantity), repeated minute is a set."""
     base = pd.Timestamp('2026-03-02T10:00:00', tz='America/New_York')
     return pd.DataFrame([dict(firm=d, cusip='BOND_A', side='bid', quote_timestamp_ET=base + pd.Timedelta(minutes=m), spread=s, quantity=q) for m,d,s,q in records])
 
 
+# TEST LOGIC: Step3Checks；仅用于复现输入或核对行为。
 class Step3Checks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: setUpClass；仅用于复现输入或核对行为。
     @classmethod
     def setUpClass(cls):
         cls.state, _ = load_dashboard()
 
+    # TEST FIXTURE LOGIC: events；仅用于复现输入或核对行为。
     def events(self, records):
         return self.state['event_history'](raw_rows(records))['events']
 
+    # TEST FIXTURE LOGIC: snapshots；仅用于复现输入或核对行为。
     def snapshots(self, events, minutes, age=30):
         base = pd.Timestamp('2026-03-02T10:00:00', tz='America/New_York')
         times = pd.DatetimeIndex([base + pd.Timedelta(minutes=m) for m in minutes])
         return self.state['asof_features'](events, times, age)
 
+    # TEST LOGIC: test_candidate_sets_keep_zero_negative_and_ignore_row_multiplicity；仅用于复现输入或核对行为。
     def test_candidate_sets_keep_zero_negative_and_ignore_row_multiplicity(self):
         e = self.events([(0,'A',-1,0),(0,'A',0,0),(0,'A',100,2),(0,'A',100,2),
                          (1,'A',-1,0),(1,'A',0,0),(1,'A',100,2)])
@@ -56,6 +65,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(e.iloc[1]['center_delta'], 0)
         self.assertTrue(e['change_age_min'].isna().all())
 
+    # TEST LOGIC: test_exact_time_aba_and_quantity_condition_switch_are_causal；仅用于复现输入或核对行为。
     def test_exact_time_aba_and_quantity_condition_switch_are_causal(self):
         e = self.events([(0,'A',10,2),(1,'A',20,2),(2,'A',10,2),(3,'A',12,5)])
         self.assertEqual(e['observed_aba'].tolist(), [False,False,True,False])
@@ -68,6 +78,7 @@ class Step3Checks(unittest.TestCase):
         g = self.state['event_history'](raw)['events']
         self.assertEqual(len(g), 2)
 
+    # TEST LOGIC: test_unknown_change_age_refresh_gap_and_day_boundary；仅用于复现输入或核对行为。
     def test_unknown_change_age_refresh_gap_and_day_boundary(self):
         e = self.events([(0,'A',10,0),(10,'A',10,0),(20,'A',12,0),(30,'A',12,0),
                          (120,'A',13,0),(121,'A',14,0),(1440,'A',14,0)])
@@ -84,6 +95,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(absent.iloc[0]['n_dealers'], 0)
         self.assertTrue(pd.isna(absent.iloc[0]['center_equal']))
 
+    # TEST LOGIC: test_fixed_window_change_counts_do_not_depend_on_datetime_unit；仅用于复现输入或核对行为。
     def test_fixed_window_change_counts_do_not_depend_on_datetime_unit(self):
         raw = raw_rows([(0,'A',10,1),(5,'A',11,1),(10,'A',12,1),(35,'A',13,1)])
         ns = self.state['event_history'](raw)['events']
@@ -92,6 +104,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(ns['changes_30m'].tolist(), [0,1,2,2])
         self.assertEqual(us['changes_30m'].tolist(), ns['changes_30m'].tolist())
 
+    # TEST LOGIC: test_future_append_does_not_rewrite_event_or_asof_features；仅用于复现输入或核对行为。
     def test_future_append_does_not_rewrite_event_or_asof_features(self):
         past = raw_rows([(0,'A',10,1),(0,'B',11,1),(10,'A',12,1),(20,'B',13,1),(35,'A',14,1)])
         future = raw_rows([(40,'A',999,1),(40,'NEW',-999,None),(1440,'B',500,1)])
@@ -104,6 +117,7 @@ class Step3Checks(unittest.TestCase):
         _, b = self.snapshots(long,[0,10,20,30,35])
         pd.testing.assert_frame_equal(a,b)
 
+    # TEST LOGIC: test_fixed_horizon_delta_is_query_batch_invariant_and_guards_composition；仅用于复现输入或核对行为。
     def test_fixed_horizon_delta_is_query_batch_invariant_and_guards_composition(self):
         e = self.events([(0,'A',10,1),(0,'B',20,1),(20,'A',12,1),(30,'A',14,1),
                          (35,'A',15,2),(40,'NEW',25,1)])
@@ -115,6 +129,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(many.iloc[-1]['composition_changed_30m'], 1)
         self.assertTrue(pd.isna(many.iloc[-1]['center_delta_30m']))
 
+    # TEST LOGIC: test_incomplete_latest_event_blocks_numeric_aggregation_without_fallback；仅用于复现输入或核对行为。
     def test_incomplete_latest_event_blocks_numeric_aggregation_without_fallback(self):
         e = self.events([(0,'A',10,1),(5,'A',20,1),(5,'A','bad',1)])
         slots,f = self.snapshots(e,[0,5,10])
@@ -123,6 +138,7 @@ class Step3Checks(unittest.TestCase):
         self.assertTrue(f.iloc[1:]['center_equal'].isna().all())
         self.assertEqual(slots.iloc[-1]['center'],20)  # Still retained for research.
 
+    # TEST LOGIC: test_dealer_equal_not_message_or_candidate_weighted；仅用于复现输入或核对行为。
     def test_dealer_equal_not_message_or_candidate_weighted(self):
         records=[(0,'A',10,0)]*20 + [(0,'B',20,0),(0,'B',40,0)]
         e=self.events(records)
@@ -131,6 +147,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(f.iloc[0]['n_dealers'],2)
         self.assertEqual(f.iloc[0]['multi_fraction'],0.5)
 
+    # TEST LOGIC: test_influence_uses_only_other_fresh_dealers_and_keeps_unsupported_values；仅用于复现输入或核对行为。
     def test_influence_uses_only_other_fresh_dealers_and_keeps_unsupported_values(self):
         e=self.events([(0,'A',100,0),(0,'B',10,0),(0,'C',10,0),(0,'D',10,0),
                        (40,'A',100,0),(50,'FUTURE',-999,0)])
@@ -144,6 +161,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(target.iloc[1]['clipped_center'],100)
         self.assertEqual(target.iloc[1]['dealer_weight'],1)
 
+    # TEST LOGIC: test_age_rules_report_lost_coverage_and_equal_age_decay；仅用于复现输入或核对行为。
     def test_age_rules_report_lost_coverage_and_equal_age_decay(self):
         e=self.events([(0,'A',10,0),(0,'B',20,0)])
         _,f=self.snapshots(e,[0,31],age=30)
@@ -154,6 +172,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(f.iloc[1]['max_decay_weight_share'],0.5)
         self.assertEqual(f.iloc[1]['decay_effective_dealers'],2)
 
+    # TEST LOGIC: test_candidate_clipping_is_visible_even_if_center_does_not_change；仅用于复现输入或核对行为。
     def test_candidate_clipping_is_visible_even_if_center_does_not_change(self):
         e=self.events([(0,'A',-100,0),(0,'A',0,0),(0,'A',100,0),
                        (0,'B',0,0),(0,'C',0,0),(0,'D',0,0)])
@@ -166,6 +185,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(f.iloc[0]['center_lower'],-25)
         self.assertEqual(f.iloc[0]['center_upper'],25)
 
+    # TEST LOGIC: test_midpoint_and_bound_changes_do_not_claim_candidate_identity；仅用于复现输入或核对行为。
     def test_midpoint_and_bound_changes_do_not_claim_candidate_identity(self):
         e=self.events([(0,'A',80,0),(0,'A',100,0),(1,'A',81,0),(1,'A',99,0),
                        (2,'A',80,1),(2,'A',100,2)])
@@ -175,6 +195,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(e.iloc[1]['hi_delta'],-1)
         self.assertTrue(pd.isna(e.iloc[2]['lo_delta']))
 
+    # TEST LOGIC: test_quantity_contrasts_require_complete_all_positive_unique_mapping；仅用于复现输入或核对行为。
     def test_quantity_contrasts_require_complete_all_positive_unique_mapping(self):
         raw=raw_rows([(0,'A',10,1),(0,'A',20,2),(0,'A',20,2),
                       (1,'A',11,1),(1,'A',12,1),(1,'A',20,2),
@@ -188,6 +209,7 @@ class Step3Checks(unittest.TestCase):
         self.assertEqual(r['events'].iloc[-1]['candidate_count'],2)
         self.assertEqual(len(r['events'].iloc[-1]['quantity_set']),2)
 
+    # TEST LOGIC: test_all_views_empty_case_and_rerun_have_one_image_no_table；仅用于复现输入或核对行为。
     def test_all_views_empty_case_and_rerun_have_one_image_no_table(self):
         state,display=load_dashboard()
         self.assertEqual(state['step3_view'].value,state['ALL_VIEWS'])
@@ -215,6 +237,7 @@ class Step3Checks(unittest.TestCase):
         self.assertTrue(all(isinstance(call.args[0],state['widgets'].VBox) for call in display.call_args_list))
         self.assertEqual(plt.get_fignums(),[])
 
+    # TEST LOGIC: test_unsupported_influence_is_unassessed_not_a_zero_impact_line；仅用于复现输入或核对行为。
     def test_unsupported_influence_is_unassessed_not_a_zero_impact_line(self):
         records=[(0,'A',80,0),(0,'A',100,0),(0,'B',95,0),(5,'A',81,0),(5,'A',101,0)]
         result=self.state['event_history'](raw_rows(records))

@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Causal pairing, existing-target ablations and complete notebook workflows (synthetic data)."""
 import ast
 import contextlib
@@ -19,12 +20,14 @@ import quote_quality_core as qc
 T=pd.Timestamp('2026-03-02 10:00',tz='America/New_York')
 
 
+# TEST FIXTURE LOGIC: raw；仅用于复现输入或核对行为。
 def raw(records):
     # minute, dealer, side, spread, raw quantity
     return pd.DataFrame([dict(cusip='X',firm=firm,side=side,spread=s,quantity=q,
         quote_timestamp_ET=T+pd.Timedelta(minutes=minute)) for minute,firm,side,s,q in records])
 
 
+# TEST FIXTURE LOGIC: fixture；仅用于复现输入或核对行为。
 def fixture():
     dates=pd.bdate_range('2026-02-16',periods=35,tz='America/New_York')
     quotes=[];trades=[]
@@ -50,12 +53,14 @@ def fixture():
     return pd.DataFrame(quotes),pd.DataFrame(trades)
 
 
+# TEST FIXTURE LOGIC: canonical；仅用于复现输入或核对行为。
 def canonical(quotes):
     q=quotes.copy();q['quote_timestamp_ET']=q.quote_timestamp_UTC.dt.tz_convert('America/New_York')
     q['ISSUER']='SYNTHETIC '+q.cusip
     return q
 
 
+# TEST FIXTURE LOGIC: model_frame；仅用于复现输入或核对行为。
 def model_frame():
     q,t=fixture();q=canonical(q)
     t=t.assign(time=t.EFFECTIVE_DATETIME_TS,cusip=t.CUSIP,row_id=np.arange(len(t)))
@@ -64,10 +69,13 @@ def model_frame():
     return t.merge(f.drop(columns=['cusip','time']),on='row_id',validate='one_to_one')
 
 
+# TEST LOGIC: PairChecks；仅用于复现输入或核对行为。
 class PairChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: pairs；仅用于复现输入或核对行为。
     def pairs(self,records,minutes=(0,),**kwargs):
         return qc.pair_snapshots(qc.event_history(raw(records))['events'],[T+pd.Timedelta(minutes=m) for m in minutes],**kwargs)
 
+    # TEST LOGIC: test_crossing_direction_locked_and_set_classes；仅用于复现输入或核对行为。
     def test_crossing_direction_locked_and_set_classes(self):
         p=self.pairs([(0,'A','bid',100,0),(0,'A','bid',120,0),(0,'A','ask',110,0),
                       (0,'B','bid',100,2),(0,'B','ask',100,2),
@@ -77,6 +85,7 @@ class PairChecks(unittest.TestCase):
         self.assertEqual(p.loc['B','gap_center'],0)
         self.assertEqual(p.loc['C','gap_center'],-5)
 
+    # TEST LOGIC: test_raw_size_matches_never_use_zero_and_keep_positive_multi；仅用于复现输入或核对行为。
     def test_raw_size_matches_never_use_zero_and_keep_positive_multi(self):
         p=self.pairs([(0,'A','bid',90,0),(0,'A','ask',80,0),
                       (0,'B','bid',90,2),(0,'B','bid',110,2),(0,'B','ask',100,2),
@@ -86,6 +95,7 @@ class PairChecks(unittest.TestCase):
         self.assertEqual(p.loc['B','matched_gap_high'],10)
         self.assertEqual(p.loc['B','matched_mid'],100)  # not pooled with the unmatched size-5 ask
 
+    # TEST LOGIC: test_asynchrony_age_exact_time_and_no_overnight；仅用于复现输入或核对行为。
     def test_asynchrony_age_exact_time_and_no_overnight(self):
         records=[(0,'A','bid',105,2),(3,'A','ask',100,2)]
         p=self.pairs(records,minutes=(-1,0,3,31,34,1440))
@@ -98,11 +108,13 @@ class PairChecks(unittest.TestCase):
         strict=self.pairs(records,minutes=(3,),allow_exact=False).iloc[0]
         self.assertFalse(strict.both)
 
+    # TEST LOGIC: test_latest_incomplete_blocks_old_valid_pair；仅用于复现输入或核对行为。
     def test_latest_incomplete_blocks_old_valid_pair(self):
         p=self.pairs([(0,'A','bid',105,2),(0,'A','ask',100,2),(1,'A','bid',np.nan,2)],minutes=(2,))
         self.assertTrue(p.iloc[0].both);self.assertFalse(p.iloc[0].complete)
         self.assertEqual(p.iloc[0]['cross'],'Unassessed');self.assertTrue(pd.isna(p.iloc[0].gap_center))
 
+    # TEST LOGIC: test_future_append_duplicates_and_query_batches_do_not_rewrite_features；仅用于复现输入或核对行为。
     def test_future_append_duplicates_and_query_batches_do_not_rewrite_features(self):
         records=[(0,'A','bid',-5,0),(0,'A','bid',5,0),(0,'A','ask',0,0),(2,'A','bid',7,2)]
         q=raw(records);queries=pd.DataFrame({'row_id':[50,21,22],'cusip':['X','X','Y'],'time':[T,T+pd.Timedelta(minutes=3),T]})
@@ -115,12 +127,14 @@ class PairChecks(unittest.TestCase):
         self.assertEqual(original.bcq_bid_n_dealers.tolist(),[1,1,0])
         with self.assertRaises(ValueError):qc.build_quote_features(q,pd.concat([queries,queries.iloc[[0]]]))
 
+    # TEST LOGIC: test_no_candidate_multiplicity_weight_and_no_dealer_cross_pairing；仅用于复现输入或核对行为。
     def test_no_candidate_multiplicity_weight_and_no_dealer_cross_pairing(self):
         p=self.pairs([(0,'A','bid',100,2),(0,'A','bid',120,2),(0,'A','ask',100,2),
                       (0,'B','bid',110,2),(0,'B','ask',100,2),(0,'C','bid',999,2)])
         f=qc.pair_features(p,[T]).iloc[0]
         self.assertEqual(f.n_pair,2);self.assertEqual(f.pair_gap,10);self.assertEqual(f.n_size_time_pair,2)
 
+    # TEST LOGIC: test_fast_side_matches_step3_reference_and_peer_support；仅用于复现输入或核对行为。
     def test_fast_side_matches_step3_reference_and_peer_support(self):
         # Reuse the previous notebook's independent reference, avoiding a second production implementation.
         source=ast.parse((ROOT/'quote_quality_step3.py').read_text())
@@ -142,10 +156,13 @@ class PairChecks(unittest.TestCase):
         self.assertEqual(strict.iloc[0].n_dealers,0)
 
 
+# TEST LOGIC: TrainingChecks；仅用于复现输入或核对行为。
 class TrainingChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: setUpClass；仅用于复现输入或核对行为。
     @classmethod
     def setUpClass(cls):cls.frame=model_frame()
 
+    # TEST LOGIC: test_baseline_anchor_units_feature_sets_and_coverage；仅用于复现输入或核对行为。
     def test_baseline_anchor_units_feature_sets_and_coverage(self):
         f=self.frame;x,specs=qc.model_versions(f)
         self.assertEqual(len(specs['Base'][0]),14)
@@ -157,6 +174,7 @@ class TrainingChecks(unittest.TestCase):
         self.assertTrue(f.loc[f.CUSIP.eq('Y'),'bcq_has_quote'].eq(0).all())
         self.assertEqual(len(f),35*2*13)
 
+    # TEST LOGIC: test_fixed_split_embargo_and_refit_excludes_test；仅用于复现输入或核对行为。
     def test_fixed_split_embargo_and_refit_excludes_test(self):
         f=self.frame
         for label,n in [('Train',23),('Validation',5),('Test',5)]:
@@ -165,6 +183,7 @@ class TrainingChecks(unittest.TestCase):
         self.assertLess(f.loc[f.refit_train,'time'].max(),f.loc[f.split.eq('Test'),'time'].min())
         with self.assertRaises(ValueError):qc.chronological_split(f,pd.NaT)
 
+    # TEST LOGIC: test_actual_training_same_rows_native_target_and_locked_baselines；仅用于复现输入或核对行为。
     def test_actual_training_same_rows_native_target_and_locked_baselines(self):
         params=dict(objective='mae',boosting_type='dart',n_estimators=4,num_leaves=4,
                     min_child_samples=2,n_jobs=1,verbosity=-1,random_state=2026)
@@ -182,9 +201,11 @@ class TrainingChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'unassessed'):qc.run_comparison(f,params)
 
 
+# TEST LOGIC: NotebookChecks；仅用于复现输入或核对行为。
 class NotebookChecks(unittest.TestCase):
     VERSIONS=('Base','Quote levels','Reliability','Age decay')
 
+    # TEST FIXTURE LOGIC: setUp；仅用于复现输入或核对行为。
     def setUp(self):
         # Notebook snapshots and narrow caches must never leak into the checkout.
         previous=Path.cwd()
@@ -194,29 +215,38 @@ class NotebookChecks(unittest.TestCase):
         os.chdir(temporary.name)
         self.folder=Path('outputs/quote_quality_step5')
 
+    # TEST FIXTURE LOGIC: load；仅用于复现输入或核对行为。
     def load(self,step):
         q,t=fixture();state={'__name__':'notebook_check'}
+        source=(ROOT/f'quote_quality_step{step}.py').read_text()
+        source=source.split('# %% 4. Continue completed validation research',1)[0]
         with contextlib.redirect_stdout(io.StringIO()),patch('pandas.read_parquet',side_effect=lambda path,*a,**k:(t if Path(path).name=='data_ig.parquet' else q).copy()),patch.object(Path,'exists',return_value=True),patch('IPython.display.display') as display:
-            exec(compile((ROOT/f'quote_quality_step{step}.py').read_text(),f'step{step}','exec'),state)
+            exec(compile(source,f'step{step}','exec'),state)
         self.assertEqual(display.call_count,1)
         return state
 
+    # TEST FIXTURE LOGIC: configure；仅用于复现输入或核对行为。
     def configure(self,s):
         s['LGB_PARAMS'].update(n_estimators=3,num_leaves=4,min_child_samples=2,n_jobs=1)
 
+    # TEST FIXTURE LOGIC: controls_cell；仅用于复现输入或核对行为。
     def controls_cell(self,step=5):
         marker='# %% 3. Research controls' if step==5 else '# %% 3. Case controls'
-        return (ROOT/f'quote_quality_step{step}.py').read_text().split(marker,1)[1]
+        source=(ROOT/f'quote_quality_step{step}.py').read_text().split(marker,1)[1]
+        return source.split('# %% 4. Continue completed validation research',1)[0]
 
+    # TEST FIXTURE LOGIC: checkpoint；仅用于复现输入或核对行为。
     def checkpoint(self):
         pointer=json.loads((self.folder/'latest.json').read_text())
         snapshot=self.folder/pointer['snapshot']
         return snapshot,json.loads((snapshot/'experiment.json').read_text())
 
+    # TEST FIXTURE LOGIC: rerun_controls；仅用于复现输入或核对行为。
     def rerun_controls(self,s):
         with patch('IPython.display.display'),contextlib.redirect_stdout(io.StringIO()):
             exec(compile(self.controls_cell(),'step5_controls','exec'),s)
 
+    # TEST LOGIC: test_step4_controls_rerun_and_combined_png；仅用于复现输入或核对行为。
     def test_step4_controls_rerun_and_combined_png(self):
         s=self.load(4);identity=s['step4_image'].model_id
         self.assertEqual(len(s['step4_figure'].axes),6)
@@ -232,6 +262,7 @@ class NotebookChecks(unittest.TestCase):
             exec(self.controls_cell(4),s)
         self.assertNotIn(old_refresh,old._trait_notifiers.get('value',{}).get('change',[]))
 
+    # TEST LOGIC: test_step5_build_validate_lock_test_are_automatic_checkpoints；仅用于复现输入或核对行为。
     def test_step5_build_validate_lock_test_are_automatic_checkpoints(self):
         import quote_quality_saved as saved
         s=self.load(5);self.configure(s)
@@ -249,6 +280,7 @@ class NotebookChecks(unittest.TestCase):
         self.assertEqual(set(restored.SECTOR),{'Energy','Utility'})
         original_files={p.name:p.read_bytes() for p in first.iterdir()}
         real_comparison=s['run_comparison'];models_seen=[];test_started=[]
+        # TEST FIXTURE LOGIC: compare；仅用于复现输入或核对行为。
         def compare(frame,params,stage='Validation',selected=None,**kwargs):
             if stage=='Test':
                 # The held-out fit cannot begin until its choice is recoverable.
@@ -309,6 +341,7 @@ class NotebookChecks(unittest.TestCase):
         self.assertEqual(manifest['locked_choice'],'Age decay')
         s['save_step5']();self.assertTrue((self.folder/'dashboard.png').is_file())
 
+    # TEST LOGIC: test_step5_completed_validation_is_reused_without_fit_or_build；仅用于复现输入或核对行为。
     def test_step5_completed_validation_is_reused_without_fit_or_build(self):
         s=self.load(5);self.configure(s)
         s['run_step5']('validate')
@@ -323,6 +356,7 @@ class NotebookChecks(unittest.TestCase):
             self.assertIn('Completed validation remains',s['step5_status'].value)
             self.assertFalse(s['step5_save'].disabled)
 
+    # TEST LOGIC: test_step5_controls_rerun_preserves_complete_work_and_locked_choice；仅用于复现输入或核对行为。
     def test_step5_controls_rerun_preserves_complete_work_and_locked_choice(self):
         s=self.load(5);self.configure(s)
         s['run_step5']('validate');s['step5_selected'].value='Age decay';s['run_step5']('test')
@@ -345,6 +379,7 @@ class NotebookChecks(unittest.TestCase):
         self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
         self.assertFalse(old_button._click_handlers.callbacks)
 
+    # TEST LOGIC: test_step5_controls_rerun_keeps_frame_only_and_validation_only；仅用于复现输入或核对行为。
     def test_step5_controls_rerun_keeps_frame_only_and_validation_only(self):
         for phase in ['build','validate']:
             with self.subTest(phase=phase):
@@ -362,6 +397,7 @@ class NotebookChecks(unittest.TestCase):
                 self.assertEqual(s['step5_validate'].disabled,phase=='validate')
                 self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
 
+    # TEST LOGIC: test_step5_new_kernel_preserves_saved_lock_without_reading_test_or_fit；仅用于复现输入或核对行为。
     def test_step5_new_kernel_preserves_saved_lock_without_reading_test_or_fit(self):
         import quote_quality_saved as saved
         s=self.load(5);self.configure(s)
@@ -393,6 +429,7 @@ class NotebookChecks(unittest.TestCase):
         self.assertNotIn('test_predictions.parquet',[Path(call.args[0]).name for call in hashes.call_args_list])
         pd.testing.assert_frame_equal(frame,s['step5_frame'])
 
+    # TEST LOGIC: test_step5_controls_rebuild_is_rejected_while_running_without_mutation；仅用于复现输入或核对行为。
     def test_step5_controls_rebuild_is_rejected_while_running_without_mutation(self):
         s=self.load(5)
         identities={name:s[name] for name in ['step5_dashboard','step5_validate','step5_image',
@@ -410,6 +447,22 @@ class NotebookChecks(unittest.TestCase):
         self.assertEqual(s['step5_validate']._click_handlers.callbacks,callbacks)
         s['step5_busy']=False
 
+    # TEST LOGIC: 原Step5按钮遇到研究面板正在工作时，不得重建特征或触发fit/test。
+    def test_original_actions_wait_for_busy_research_without_mutating_completed_objects(self):
+        s=self.load(5)
+        identities={name:s[name] for name in ['step5_frame','step5_predictions',
+                    'step5_test_predictions','step5_event_cache','step5_clock_stop']}
+        s['step5_research_busy']=True
+        with patch.dict(s,run_comparison=Mock(side_effect=AssertionError('research action still running')),
+                        build_quote_features=Mock(side_effect=AssertionError('must not rebuild'))):
+            for action in ['preview','build','validate','test']:
+                with self.subTest(action=action):
+                    s['run_step5'](action)
+                    self.assertFalse(s['step5_busy'])
+                    self.assertTrue(s['step5_research_busy'])
+                    for name,value in identities.items():self.assertIs(s[name],value)
+
+    # TEST LOGIC: test_step5_changed_settings_or_input_reject_fit_and_test_keep_old_results；仅用于复现输入或核对行为。
     def test_step5_changed_settings_or_input_reject_fit_and_test_keep_old_results(self):
         for changed in ['params','input']:
             with self.subTest(changed=changed):
@@ -442,6 +495,7 @@ class NotebookChecks(unittest.TestCase):
                 self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
                 self.assertIn('Inputs or settings changed',s['step5_status'].value)
 
+    # TEST LOGIC: test_step5_validation_checkpoint_failure_keeps_memory_export_retries；仅用于复现输入或核对行为。
     def test_step5_validation_checkpoint_failure_keeps_memory_export_retries(self):
         import quote_quality_saved as saved
         s=self.load(5);self.configure(s);s['run_step5']('build')
@@ -465,6 +519,7 @@ class NotebookChecks(unittest.TestCase):
         pd.testing.assert_frame_equal(pred_saved,predictions)
         self.assertTrue(manifest['validation_available'])
 
+    # TEST LOGIC: test_step5_interrupt_stops_timer_and_retains_completed_features；仅用于复现输入或核对行为。
     def test_step5_interrupt_stops_timer_and_retains_completed_features(self):
         s=self.load(5);self.configure(s);s['run_step5']('build');built=s['step5_frame']
         with patch.dict(s,run_comparison=lambda *a,**k:(_ for _ in ()).throw(KeyboardInterrupt())):

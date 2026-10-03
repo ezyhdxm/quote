@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Common-dealer diagnostics and case navigation preserve causal quote semantics."""
 import unittest
 from unittest.mock import patch
@@ -6,17 +7,21 @@ import pandas as pd
 from test_quality_step3 import load_dashboard, raw_rows
 
 
+# TEST LOGIC: Step3IterationChecks；仅用于复现输入或核对行为。
 class Step3IterationChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: setUpClass；仅用于复现输入或核对行为。
     @classmethod
     def setUpClass(cls):
         cls.state, _ = load_dashboard()
 
+    # TEST FIXTURE LOGIC: features；仅用于复现输入或核对行为。
     def features(self, records, minutes):
         events = self.state['event_history'](raw_rows(records))['events']
         base = pd.Timestamp('2026-03-02 10:00', tz='America/New_York')
         times = pd.DatetimeIndex([base + pd.Timedelta(minutes=m) for m in minutes])
         return self.state['asof_features'](events, times)
 
+    # TEST LOGIC: test_common_changes_survive_condition_switch_and_roster_entry；仅用于复现输入或核对行为。
     def test_common_changes_survive_condition_switch_and_roster_entry(self):
         # A changes quantity while NEW enters: retain A's observed change as a
         # diagnostic, with explicit retention, while keeping guarded feature NaN.
@@ -33,6 +38,7 @@ class Step3IterationChecks(unittest.TestCase):
         _, many = self.features(records, [0, 5, 10, 25, 30])
         pd.testing.assert_series_equal(row, many.loc[row.name])
 
+    # TEST LOGIC: test_incomplete_current_and_day_boundary_do_not_revive_common_price；仅用于复现输入或核对行为。
     def test_incomplete_current_and_day_boundary_do_not_revive_common_price(self):
         records = [(0, 'A', 10, 1), (30, 'A', 20, 1), (30, 'A', 'bad', 1)]
         _, f = self.features(records, [30, 1440])
@@ -41,6 +47,7 @@ class Step3IterationChecks(unittest.TestCase):
         self.assertTrue(f.common_dealer_delta_30m.isna().all())
         self.assertTrue(f.aggregate_delta_30m.isna().all())
 
+    # TEST LOGIC: test_apply_batches_age_and_display_change_reuses_case；仅用于复现输入或核对行为。
     def test_apply_batches_age_and_display_change_reuses_case(self):
         state, _ = load_dashboard()
         original = state['asof_features']

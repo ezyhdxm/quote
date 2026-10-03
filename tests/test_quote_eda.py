@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Checks for the interactive notebook's cleaning and dropdown behavior."""
 import contextlib
 import io
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+# TEST FIXTURE LOGIC: fixture；仅用于复现输入或核对行为。
 def fixture():
     times = pd.date_range('2026-03-02 09:55', '2026-03-02 11:00', freq='5min')
     rows = [(bond,firm,side,when,60+10*i+j*j*.03+offset,1.)
@@ -27,6 +29,7 @@ def fixture():
     return q,t,m
 
 
+# TEST FIXTURE LOGIC: load；仅用于复现输入或核对行为。
 def load(q,t,m,**settings):
     with contextlib.redirect_stdout(io.StringIO()), patch('IPython.display.display'):
         ns = runpy.run_path(str(ROOT/'quote_eda.py'),init_globals={'bcq_df':q,'data_ig':t,
@@ -36,13 +39,16 @@ def load(q,t,m,**settings):
     return ns
 
 
+# TEST FIXTURE LOGIC: state；仅用于复现输入或核对行为。
 def state(r,when,firm='A',side='bid',bond='BOND00001'):
     frame = r['states']
     return frame.loc[frame.time.eq(pd.Timestamp(when,tz='America/New_York')) & frame.cusip.eq(bond)
                      & frame.firm.eq(firm) & frame.side.eq(side)].iloc[0]
 
 
+# TEST LOGIC: DashboardChecks；仅用于复现输入或核对行为。
 class DashboardChecks(unittest.TestCase):
+    # TEST LOGIC: test_universe_independent_of_quote_window_and_prefilter；仅用于复现输入或核对行为。
     def test_universe_independent_of_quote_window_and_prefilter(self):
         q,t,m=fixture()
         t=t.loc[t.CUSIP.ne('BOND00003')]
@@ -53,12 +59,14 @@ class DashboardChecks(unittest.TestCase):
         self.assertTrue(full['coverage'].n_trades.eq(1).all())
         pd.testing.assert_frame_equal(full['levels'],filtered['levels'])
 
+    # TEST LOGIC: test_explicit_universe_dates；仅用于复现输入或核对行为。
     def test_explicit_universe_dates(self):
         q,t,m=fixture()
         t.loc[t.CUSIP.eq('BOND00003'),'EFFECTIVE_DATETIME_TS']=pd.Timestamp('2025-11-30')
         r=load(q,t,m,TRADE_UNIVERSE_START='2025-12-01',TRADE_UNIVERSE_END='2026-03-01')['result']
         self.assertEqual(len(r['coverage']),2)
 
+    # TEST LOGIC: test_event_time_strictly_before_and_future_independence；仅用于复现输入或核对行为。
     def test_event_time_strictly_before_and_future_independence(self):
         q,t,m=fixture()
         base=load(q,t,m)['result']
@@ -71,6 +79,7 @@ class DashboardChecks(unittest.TestCase):
         pd.testing.assert_frame_equal(base['levels'].loc[lambda x:x.index.get_level_values('time')<=cutoff],
                                      changed['levels'].loc[lambda x:x.index.get_level_values('time')<=cutoff])
 
+    # TEST LOGIC: test_expiry_and_invalid_latest_never_revive_old_quote；仅用于复现输入或核对行为。
     def test_expiry_and_invalid_latest_never_revive_old_quote(self):
         q,t,m=fixture()
         target=q.cusip.eq('BOND00001') & q.firm.eq('A') & q.side.eq('bid')
@@ -83,6 +92,7 @@ class DashboardChecks(unittest.TestCase):
         r=load(pd.concat([q,row.to_frame().T],ignore_index=True),t,m)['result']
         self.assertEqual(state(r,'2026-03-02 10:10').reason,'nonfinite')
 
+    # TEST LOGIC: test_large_timestamp_conflict_invalidates_latest_state；仅用于复现输入或核对行为。
     def test_large_timestamp_conflict_invalidates_latest_state(self):
         q,t,m=fixture()
         row=q.loc[q.cusip.eq('BOND00001') & q.firm.eq('A') & q.side.eq('bid')
@@ -94,6 +104,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertEqual(state(b,'2026-03-02 10:05').reason,'timestamp conflict')
         self.assertTrue(pd.isna(state(a,'2026-03-02 10:05').spread))
 
+    # TEST LOGIC: test_tight_timestamp_batch_median_and_feed_sequence；仅用于复现输入或核对行为。
     def test_tight_timestamp_batch_median_and_feed_sequence(self):
         q,t,m=fixture()
         q['seq']=1
@@ -110,6 +121,7 @@ class DashboardChecks(unittest.TestCase):
         b=load(combined,t,m,QUOTE_SEQUENCE_COL='seq')['result']
         self.assertAlmostEqual(state(b,'2026-03-02 10:05').spread,old+1)
 
+    # TEST LOGIC: test_one_sided_zero_placeholder_rejects_only_identified_bad_leg；仅用于复现输入或核对行为。
     def test_one_sided_zero_placeholder_rejects_only_identified_bad_leg(self):
         q,t,m=fixture()
         q.loc[q.firm.eq('A') & q.side.eq('bid'),'spread']=0
@@ -119,6 +131,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertFalse(r['clean'].spread.eq(0).any())
         self.assertTrue((r['levels'].bid.dropna()>=r['levels'].ask.reindex(r['levels'].bid.dropna().index)).all())
 
+    # TEST LOGIC: test_conflicting_rows_at_same_maximum_sequence_are_not_arbitrarily_resolved；仅用于复现输入或核对行为。
     def test_conflicting_rows_at_same_maximum_sequence_are_not_arbitrarily_resolved(self):
         q,t,m=fixture()
         q['seq']=1
@@ -128,6 +141,7 @@ class DashboardChecks(unittest.TestCase):
         r=load(pd.concat([q,row.to_frame().T],ignore_index=True),t,m,QUOTE_SEQUENCE_COL='seq')['result']
         self.assertEqual(state(r,'2026-03-02 10:05').reason,'timestamp conflict')
 
+    # TEST LOGIC: test_zero_and_negative_prices_are_not_rejected_by_sign；仅用于复现输入或核对行为。
     def test_zero_and_negative_prices_are_not_rejected_by_sign(self):
         q,t,m=fixture()
         q['spread']=(pd.Timestamp('2026-03-02 10:10')-q.quote_timestamp_ET).dt.total_seconds()/300
@@ -139,6 +153,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertTrue(r['matched'].spread.eq(0).any())
         self.assertTrue(r['matched'].spread_old.eq(0).any())
 
+    # TEST LOGIC: test_crossed_pair_rejects_both_when_bad_leg_unknown；仅用于复现输入或核对行为。
     def test_crossed_pair_rejects_both_when_bad_leg_unknown(self):
         q,t,m=fixture()
         q.loc[q.firm.eq('A') & q.side.eq('ask'),'spread']+=10
@@ -147,6 +162,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertEqual(state(r,'2026-03-02 10:05',side='ask').reason,'crossed dealer pair')
         self.assertFalse(r['pairs'].loc[r['pairs'].clean,'crossed'].any())
 
+    # TEST LOGIC: test_aggregate_crossing_with_no_common_pair_is_withheld；仅用于复现输入或核对行为。
     def test_aggregate_crossing_with_no_common_pair_is_withheld(self):
         q,t,m=fixture()
         q=q.loc[(q.firm.eq('A') & q.side.eq('bid')) | (q.firm.eq('B') & q.side.eq('ask'))].copy()
@@ -157,6 +173,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertTrue(r['levels'].isna().all().all())
         self.assertGreater(r['audit']['suppressed_consensus_crossings'],0)
 
+    # TEST LOGIC: test_common_pair_consensus_cannot_cross；仅用于复现输入或核对行为。
     def test_common_pair_consensus_cannot_cross(self):
         q,t,m=fixture()
         q=q.loc[q.firm.ne('C')].copy()
@@ -165,6 +182,7 @@ class DashboardChecks(unittest.TestCase):
         r=load(q,t,m,PAIR_MAX_GAP='1min')['result']
         self.assertTrue((r['levels'].dropna().bid>=r['levels'].dropna().ask).all())
 
+    # TEST LOGIC: test_unknown_sizes_supported_known_mismatch_unpaired；仅用于复现输入或核对行为。
     def test_unknown_sizes_supported_known_mismatch_unpaired(self):
         q,t,m=fixture()
         q['quantity']=0
@@ -179,6 +197,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertFalse(r['pairs'].eligible.any())
         self.assertTrue(r['changes'].count().ge(3).all())
 
+    # TEST LOGIC: test_peer_filter_and_refresh_age；仅用于复现输入或核对行为。
     def test_peer_filter_and_refresh_age(self):
         q,t,m=fixture()
         q.loc[q.firm.eq('A') & q.side.eq('bid'),'spread']=100
@@ -187,6 +206,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertEqual(state(r,'2026-03-02 10:30').age_min,5)
         self.assertEqual(state(r,'2026-03-02 10:30').change_age_min,35)
 
+    # TEST LOGIC: test_dropdown_switches_issuer_and_display_toggles_do_not_recompute；仅用于复现输入或核对行为。
     def test_dropdown_switches_issuer_and_display_toggles_do_not_recompute(self):
         q,t,m=fixture()
         m.loc[m.CUSIP.eq('BOND00003'),'ISSUER']='OTHER'
@@ -203,6 +223,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertIs(callback_globals['result'],other)
         self.assertTrue(all(trace.visible for trace in other['figures'][1].data if trace.meta in ['raw','trend']))
 
+    # TEST LOGIC: test_display_trend_never_fills_missing_points_or_changes_analysis；仅用于复现输入或核对行为。
     def test_display_trend_never_fills_missing_points_or_changes_analysis(self):
         q,t,m=fixture()
         q=q.loc[q.quote_timestamp_ET.le(pd.Timestamp('2026-03-02 10:00'))]
@@ -219,6 +240,7 @@ class DashboardChecks(unittest.TestCase):
             ns['trend_box'].value=True
         pd.testing.assert_frame_equal(before,r['changes'])
 
+    # TEST LOGIC: test_one_sided_quotes_and_pca_meaningful_subset；仅用于复现输入或核对行为。
     def test_one_sided_quotes_and_pca_meaningful_subset(self):
         q,t,m=fixture()
         r=load(q.loc[q.side.eq('bid')],t,m)['result']
@@ -228,6 +250,7 @@ class DashboardChecks(unittest.TestCase):
         self.assertAlmostEqual(r['pca_variance'].sum(),1.)
         self.assertEqual(len(r['pca_loadings']),3)
 
+    # TEST LOGIC: test_timezone_conversion；仅用于复现输入或核对行为。
     def test_timezone_conversion(self):
         q,t,m=fixture()
         base=load(q,t,m)['result']

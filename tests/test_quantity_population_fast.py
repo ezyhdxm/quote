@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Step 1 must summarize quantities without starting the history/cache pipeline."""
 import time
 import unittest
@@ -18,7 +19,9 @@ HISTORY = {"continuous_event_transitions", "unchanged_pair_refresh_events",
            "changed_spread_events", "changed_condition_events"}
 
 
+# TEST LOGIC: FastQuantityChecks；仅用于复现输入或核对行为。
 class FastQuantityChecks(unittest.TestCase):
+    # TEST LOGIC: test_descriptive_tables_match_full_path_without_history；仅用于复现输入或核对行为。
     def test_descriptive_tables_match_full_path_without_history(self):
         trades, quotes = fixture()
         raw = attach_quote_metadata(quotes, build_bond_universe(trades))
@@ -35,6 +38,7 @@ class FastQuantityChecks(unittest.TestCase):
         self.assertIn("Refresh/change history was not evaluated", text)
         self.assertNotIn("Unchanged pair refresh=0", text)
 
+    # TEST LOGIC: test_same_positive_quantity_multi_exact_timestamps_and_incomplete_rows；仅用于复现输入或核对行为。
     def test_same_positive_quantity_multi_exact_timestamps_and_incomplete_rows(self):
         base = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
         trades = pd.DataFrame({"CUSIP": ["A", "NO_QUOTE"], "ISSUER": ["Alpha", "Beta"],
@@ -62,6 +66,7 @@ class FastQuantityChecks(unittest.TestCase):
         self.assertEqual((s.no_quote_bonds, s.raw_zero_rows, s.raw_missing_rows, s.raw_other_rows), (1, 1, 1, 1))
         self.assertEqual(p["raw"].spread.eq(-1).sum(), 2)
 
+    # TEST LOGIC: test_sector_unknown_conflicting_and_no_quote_input；仅用于复现输入或核对行为。
     def test_sector_unknown_conflicting_and_no_quote_input(self):
         trades, quotes = fixture()
         p = quantity_population_tables(trades, quotes.iloc[:0])
@@ -72,6 +77,7 @@ class FastQuantityChecks(unittest.TestCase):
         self.assertEqual(p["tables"]["Dealer"].index.tolist(), ["[No observed dealer]"])
         self.assertIn("not evaluated", summary_html(scope_selection(p)))
 
+    # TEST LOGIC: test_unkeyed_quantity_rows_remain_in_raw_denominators；仅用于复现输入或核对行为。
     def test_unkeyed_quantity_rows_remain_in_raw_denominators(self):
         trades, quotes = fixture()
         p = quantity_population_tables(trades, quotes)
@@ -80,6 +86,7 @@ class FastQuantityChecks(unittest.TestCase):
         self.assertEqual((missing.raw_rows, missing.raw_other_rows, missing.events, missing.unkeyed_rows), (1, 1, 0, 1))
         self.assertEqual(missing.traded_bonds, 4)
 
+    # TEST LOGIC: test_large_integer_quantity_uses_existing_float_condition_semantics；仅用于复现输入或核对行为。
     def test_large_integer_quantity_uses_existing_float_condition_semantics(self):
         base = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
         trades = pd.DataFrame({"CUSIP": ["A"], "ISSUER": ["Alpha"], "EFFECTIVE_DATETIME_TS": [base]})
@@ -89,6 +96,7 @@ class FastQuantityChecks(unittest.TestCase):
         self.assertEqual(p["events"].n_quantity.iloc[0], 1)
         self.assertTrue(p["events"].same_positive_multi.iloc[0])
 
+    # TEST LOGIC: test_high_cardinality_path_never_calls_history_cache_or_per_group_summary；仅用于复现输入或核对行为。
     def test_high_cardinality_path_never_calls_history_cache_or_per_group_summary(self):
         n = 10000
         base = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")

@@ -1,3 +1,88 @@
+# Continue the completed Step5 validation
+
+The finite extension is already included at the bottom of
+`quote_quality_step5.ipynb`, under **Continue completed validation — run only this
+cell**. Update the checkout, reopen the updated notebook while keeping the
+existing **idle Step5 kernel**, and run **only the fourth/final code cell**.
+No code needs to be copied or added. The first three cells retain the original
+load/preview/validation workflow and do not need to run again.
+
+The final cell reuses completed frame, predictions and `step5_event_cache`.
+Repeated execution displays the existing research session, retaining its sidecar
+and incremental predictions. Either panel's busy flag blocks overlapping work.
+A missing or unverifiable saved result displays an error without starting a new
+load or fit. A fresh kernel can review saved validation, but movement construction
+requires the original event cache or a matching saved movement sidecar.
+
+`quote_quality_step5_research.ipynb` remains an optional standalone three-cell
+entry for the same panel. Prefer the integrated final cell in the original kernel.
+
+1. **Review losses**: compare saved predictions on identical validation rows.
+   Read quote support, age, ambiguity, quantity, issuer-trade activity, SECTOR,
+   size/type and daily slices. Mean loss, total contribution and P95 have separate
+   meanings. Fixed thresholds are declared before looking at these errors.
+2. **Review rule effects**, then **Freeze cases**: use only actual Train/Validation
+   queries inside quote-file dates. Freeze 6 random, 6 typical and up to 6 measured
+   high-impact bond/side/day cases; begin with two from each group. Existing case
+   files are preserved. This path never calls the expensive population probes.
+3. **Build movement features**: reuse the checked in-memory events with the fixed
+   30-minute window. Output stays separate from the original Step5 snapshot.
+   Coverage is shown and a completed sidecar is saved before fitting is enabled.
+4. **Fit Direction (1)**, then optionally **Fit Issuer (1)**: each action trains
+   one independent candidate against the saved **Age decay** reference, keeping
+   its model budget, BASE14, targets, anchors and rows. Completed matching runs
+   restore instead of fitting again. Original four-model predictions are retained.
+
+All dashboards automatically save complete PNGs under
+`outputs/quote_quality_incremental/`. Numerical diagnostics and immutable
+feature/result snapshots remain available there; no large tables are printed.
+Core event calculations are unchanged. Comment-only edits now preserve the existing
+checked event-cache identity, including old LF/CRLF source-file variants.
+
+Direction compares the same dealers at both endpoints, within one ET date, with
+fresh complete states. Unknown or missing movement stays NaN with zero support
+counts. Changed quantity/candidate conditions are described separately; raw
+zero/negative spreads, missing size and crossing are retained. Issuer direction
+uses equal-weight other-bond movements, excludes the target CUSIP, and requires
+at least two other supported bonds. Donor issuer membership must already be known
+at the start of the window, so later metadata cannot fill earlier gaps.
+
+The existing `MEAN_ISSUER_SPREAD_DEV` already summarizes intervening same-issuer
+**trade** deviations from each bond's rolling mean. New quote movement tests
+information beyond that BASE signal; coverage or synthetic checks alone are not
+prediction gains. This extension only selects on validation. It has no locked-test
+action, and the original Step5 test selector does not include the two new candidate
+names. Complete the validation review before wiring a chosen new candidate into
+the final locked-test run. An existing test lock/exposure blocks new fits here.
+
+Do not rerun Step1–4 as a batch for this iteration. Reuse their existing summaries
+and inspect only the fixed local Step3/4 cases that affect a feature/cleaning decision.
+
+---
+
+# Code reading convention
+
+All current Step1–5 quality modules, their seven notebooks, and the finite
+extension use `CORE LOGIC: STEP n` for domain calculations. Each core block has
+at most ten physical nonblank, noncomment code lines, a concrete `Input:` /
+`Output:` example, and `Trick:` notes for subtle behavior. Steps restart within
+functions/cells. Plotting, caching, I/O, UI, configuration and test scaffolding
+have separate responsibility labels, including the requested `CACHEING LOGIC`
+spelling. Comments describe synthetic examples, not observed model improvements.
+
+Run `python tools/check_logic_comments.py` to check block sizes and example
+presence without loading data. Example correctness and classification also need
+review. Paired Step1–5 Python/notebook code remains synchronized. Repository
+`AGENTS.md` preserves the same requirements for later work. The external existing
+`data.load_merged_prints` loader is not vendored here; its implementation and the
+production pipelines remain unchanged.
+
+This annotation update requires no kernel restart, model fit or notebook rerun.
+For future cold-cache work, deploy the updated cache module with the core module;
+an already-imported old cache function still hashes raw source bytes until that
+module is reloaded in an idle kernel. The current extension uses the existing
+in-memory Step5 event table and does not need to rebuild it.
+
 # First population iteration
 
 Step1/2 open at **Global**, with **SECTOR**, **Dealer** and **Issuer** scopes;
@@ -28,14 +113,18 @@ serialize candidate sets, or touch the event cache. Load and summary phases show
 elapsed time. History-dependent refresh/change statistics are unassessed here.
 Step2–4 share checked narrow-event Parquet caches under
 `outputs/quote_quality_cache/`. Source content, full-row duplicate semantics,
-core code and cache schema identify the cache; changes or damaged files rebuild
-it. Raw values are preserved, timestamps are not rounded, and no-quote targets
+core executable structure and cache schema identify the cache; changes or damaged
+files rebuild it. Comment/format-only changes preserve the key. The exact original
+core AST maps to its old raw-file identity so pre-annotation caches still load;
+other code versions use an AST digest. File-content checks remain mandatory. Raw values are preserved, timestamps are not rounded, and no-quote targets
 retain zero counts/NaN values. This is event reuse, not interrupted-model resume.
 Step5 saves completed features and predictions automatically. Partial-model
 resume remains unsupported; validation review never opens saved test predictions.
 
-Run revised Step1–4 sequentially in a separate research kernel; preserve the
-completed Step5 kernel. All notebooks still have three code cells and complete
+For an initial setup, Step1–4 can run in a separate research kernel; preserve the
+completed Step5 kernel. The current finite iteration above does not require
+repeating that initial setup. Step1–4 have three code cells; Step5 adds a fourth
+independent continuation cell. All dashboards retain complete
 PNG export. Synthetic checks establish implementation equivalence; real timing,
 sector findings and locked-test gains must come from the research data.
 
@@ -66,45 +155,18 @@ Completed live validation disables repeat fitting. These safeguards do not make
 an already viewed test period unseen. After a kernel restart, saved validation
 can be reviewed by the helper; do not assume a new kernel means an unlocked test.
 
-For a hot update in the current idle Step5 kernel, save your local notebook edits,
-pull the updated files, and run **only the revised third controls cell**. It
-reloads the small core/review modules without loading data or building full
-features. It can redraw a preview if no full experiment exists. The four-version
-recovery starts only when **Run validation (4)** is clicked. Wait for its automatic
-save to complete before closing the kernel. No remote data is available to the
-repository checks; recovery and SECTOR findings still require the actual run.
+For the current continuation, use the final cell already present in the updated
+Step5 notebook. The third controls cell is needed only when intentionally updating
+the original preview/build/validation interface; it is not the research entry.
+Never restart a kernel or repeat validation just to refresh the research display.
 
-For an existing live Step5 session, one new cell is enough:
-
-```python
-from quote_quality_saved import show_validation_sectors
-sector_review = show_validation_sectors(step5_frame, step5_predictions, selected="Quote levels")
-```
-
-Repeat with `selected="Reliability"` and then a rule choice such as `"Age decay"`.
-Each complete 2×2 PNG has sector MAE deltas, target-row quote/pair coverage,
-sector × ET-date deltas with sample counts, and sector tail-error deltas.
-SECTOR uses the target trade row, not a CUSIP-wide mapping, and does not change
-the 14 BASE_FEATURES. Missing sectors stay Unknown; unmatched or unequal model
-cohorts fail before drawing. Date-equal and leave-one-date diagnostics are
-sensitivity checks, not confidence intervals. Keep the locked test unopened
-until the validation choice is final.
-
-The same live kernel can review rule effects at every eligible trade query:
-
-```python
-from quote_quality_saved import show_trade_rule_effects
-trade_rule_review = show_trade_rule_effects(
-    step5_frame, bcq_df.quote_timestamp_ET.min(), bcq_df.quote_timestamp_ET.max()
-)
-```
-
-This exports one six-panel `trade_query_rule_effects.png`. Historical targets
-outside the quote file's ET dates are counted separately. Clip/downweight effects
-without sufficient other-dealer support are unassessed. Different bonds are
-never averaged into a price. This checks feature/cleaning effects, not test loss.
-If this module was imported before updating code, use `importlib.reload` on it
-once; preserve the completed Step5 frame and predictions.
+The research panel's **Review sector/tails** button compares the chosen saved
+model with its direct reference. Target-trade SECTOR, daily sensitivity and tail
+errors use the same validation rows. Missing sectors remain Unknown; these
+sensitivity checks are not confidence intervals. **Review rule effects** evaluates
+feature changes at actual Train/Validation trade queries, with historical targets
+outside the quote-file dates reported separately. Unsupported peer effects stay
+unassessed. These controls are already wired; no extra code cell is required.
 
 ---
 
@@ -112,8 +174,9 @@ once; preserve the completed Step5 frame and predictions.
 
 Open `quote_quality_step4.ipynb` for same-dealer bid/ask pairing and
 `quote_quality_step5.ipynb` for the BondCliQ increment over the supplied BASE model.
-Each notebook has **three code cells**, includes the existing data loader, and displays
-all panels together in one image. `Save all PNG` exports the complete dashboard.
+Step4 has **three code cells**. Step5 has the original three plus a final,
+independent continuation cell for completed validation. The original cells include
+the existing data loader; dashboards display all panels together in one image. `Save all PNG` exports the complete dashboard.
 Keep `quote_quality_core.py` beside the notebooks; matching `.py` files are included.
 Install the repository requirements and run from your project directory containing `data/`.
 No private data or executed notebook outputs are included in the repository.
@@ -208,7 +271,7 @@ dates. Thus its Base error is not directly comparable to the older screenshot's 
 Actual quote coverage in each split is shown before training. Empty quote support
 in training/evaluation raises an unassessed message. No price errors are used to choose dates.
 
-1. Run the three cells: one-issuer preview shows coverage and rule effects.
+1. For a first experiment only, run the first three cells: one-issuer preview shows coverage and rule effects. For already completed validation, run only the final continuation cell instead.
 2. `Build all features` constructs the full experiment, including no-quote trades.
 3. `Run validation (4)` compares the declared four-version recovery chain. The four panels show MAE, daily loss
    differences, same-row coverage/type/par-quantity subgroups and pooled P95 error.

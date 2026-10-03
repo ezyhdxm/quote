@@ -1,3 +1,4 @@
+# SETUP LOGIC: 模块定义与已有依赖；导入本身不表示计算或训练已完成。
 # %% [markdown]
 # # Step 3 — quote cleaning choices and point-in-time feature drafts
 # Run three cells. Choose issuer and dealer / bond / side / ET day.
@@ -5,6 +6,7 @@
 # The shown rules are hypotheses for later chronological validation, not a fitted cleaner.
 
 # %% 1. Load the same data and traded-bond universe
+# SETUP LOGIC: 现成loader、数组、绘图和控件依赖。
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -19,17 +21,24 @@ from time import perf_counter
 from quote_quality_core import event_history, side_features_fast
 from quote_quality_cache import prepare_quote_events
 
+# CONFIGURATION LOGIC: 沿用原路径；本次注释不改变数据来源。
 PIPELINE_CSV = Path("data/pipeline/data_pipeline.csv_20260506")
 BENCHMARK_CSV = Path("data/pipeline/DailyCloseUSTBenchmarks.csv_20260506")
 RAW_QUOTES_FILE = Path("data/bondcliq/quotes_pretrade_260301_260401_Wells_quotes2.parquet")
 DATA_IG_CACHE = Path("data/pipeline/data_ig.parquet")
 
+# SETUP LOGIC: to_ny_datetime：函数接口；计算阶段见内部CORE标记。
 def to_ny_datetime(series):
+    # CORE LOGIC: STEP 1 — 统一纽约时间
+    # Input: series=["2026-03-02 15:00:00+00:00"].
+    # Output: [2026-03-02 10:00:00-05:00].
+    # Trick: 有时区用convert；无时区按本地纽约时间localize，不误当UTC。
     values = pd.to_datetime(series, errors="coerce", format="mixed")
     if values.dt.tz is None:
         return values.dt.tz_localize("America/New_York")
     return values.dt.tz_convert("America/New_York")
 
+# CACHEING LOGIC: 有现成trade Parquet就读取；否则调用原loader并保存缓存。
 if DATA_IG_CACHE.exists():
     data_ig = pd.read_parquet(DATA_IG_CACHE)
 else:
@@ -42,11 +51,20 @@ else:
     DATA_IG_CACHE.parent.mkdir(parents=True, exist_ok=True)
     data_ig.to_parquet(DATA_IG_CACHE, index=False)
 
+# FILE IO LOGIC: 读取现有quote文件；不在这里做新模型训练。
 bcq_df = pd.read_parquet(RAW_QUOTES_FILE)
+# CORE LOGIC: STEP 1 — 固定traded-bond universe并转换quote时间
+# Input: data_ig.CUSIP=[A]; quotes=[(A,15:00 UTC),(Z,15:00 UTC)] on 2026-03-02.
+# Output: 仅A保留，quote_timestamp_ET=10:00-05:00；Z不在universe。
+# Trick: UTC必须显式声明；isin保留universe内所有quote行，不按spread符号过滤。
 bcq_df = bcq_df.loc[bcq_df["cusip"].isin(data_ig["CUSIP"])].copy()
 bcq_df["quote_timestamp_ET"] = pd.to_datetime(
     bcq_df["quote_timestamp_UTC"], utc=True, errors="coerce", format="mixed",
 ).dt.tz_convert("America/New_York")
+# CORE LOGIC: STEP 2 — 给展示行附issuer
+# Input: data_ig=[(CUSIP=A,ISSUER=I)]; quote.cusip=[A].
+# Output: quote.ISSUER=[I].
+# Trick: drop_duplicates沿用现成loader映射；这里不是新增因果issuer因子的prefix映射。
 cusip_issuer = (data_ig[["ISSUER", "CUSIP"]].dropna()
                 .drop_duplicates("CUSIP").set_index("CUSIP")["ISSUER"])
 bcq_df["ISSUER"] = bcq_df["cusip"].map(cusip_issuer)
@@ -63,6 +81,7 @@ bcq_df["ISSUER"] = bcq_df["cusip"].map(cusip_issuer)
 # First observed change ages are unknown; no fill across ET days. Center is descriptive, not executable.
 
 # %% 2. Event sets, as-of comparisons and figures
+# CONFIGURATION LOGIC: 事件键、固定30min窗口和研究阈值；只声明，不自动清洗。
 KEYS = ["firm", "cusip", "side", "quote_timestamp_ET"]
 SERIES = KEYS[:3]
 GRID = "5min"
@@ -78,29 +97,48 @@ ALL_VIEWS = "All four"
 
 # Event construction is shared across issuers. Source rows remain in bcq_df;
 # only the narrow diagnostic columns travel through the case interface.
+# CACHEING LOGIC: 同一loaded对象复用事件表；仅source对象改变才重新prepare。
 if globals().get("step3_source") is not bcq_df:
     step3_prepared = prepare_quote_events(bcq_df)
     step3_source = bcq_df
     step3_raw = bcq_df[KEYS + ["spread", "quantity", "ISSUER"]].copy()
+    # CORE LOGIC: STEP 3 — 保留重复和spread有限性标记
+    # Input: raw spreads=[0,-2,+inf], quantities=[0,2,None]，三行互不重复。
+    # Output: repeat=[False,False,False]; s=[0,-2,NaN]; q=[0,2,NaN].
+    # Trick: 零/负spread保留；仅非有限数成为NaN用于可用性描述。
     step3_raw["repeat"] = bcq_df.duplicated()
     step3_raw["s"] = pd.to_numeric(step3_raw.spread, errors="coerce").replace([np.inf, -np.inf], np.nan)
     step3_raw["q"] = pd.to_numeric(step3_raw.quantity, errors="coerce")
+    # CORE LOGIC: STEP 4 — 明确quantity类别
+    # Input: quantity=[None,0,2,-1].
+    # Output: qkind=[Missing,Zero,Positive,Other]; 初始qtag同类别名。
+    # Trick: np.select按条件先后匹配；0不当已知正数量。
     step3_raw["qkind"] = np.select(
         [step3_raw.quantity.isna(), step3_raw.q.eq(0), np.isfinite(step3_raw.q) & step3_raw.q.gt(0)],
         ["Missing", "Zero", "Positive"], default="Other")
     step3_raw["qtag"] = step3_raw.qkind.astype(str)
+    # CORE LOGIC: STEP 5 — 保留具体数量标签与不完整标记
+    # Input: q=[2,-1,0]; qkind=[Positive,Other,Zero]; s=[60,NaN,0].
+    # Output: qtag=[q=2.0,Other:-1,Zero]; bad=[False,True,False].
+    # Trick: repr(float(v))避免用显示四舍五入合并不同正数量。
     positive = step3_raw.qkind.eq("Positive")
     step3_raw.loc[positive, "qtag"] = step3_raw.loc[positive, "q"].map(lambda v: "q=" + repr(float(v)))
     other = step3_raw.qkind.eq("Other")
     step3_raw.loc[other, "qtag"] = "Other:" + step3_raw.loc[other, "quantity"].astype(str)
     step3_raw["bad"] = step3_raw.s.isna()
+    # CACHEING LOGIC: 重置此数据source的局部案例缓存；不更改原始rows。
     step3_case_cache = {}
     step3_population = None
     step3_manifest = None
 
 
+# SETUP LOGIC: issuer_choices：函数接口；计算阶段见内部CORE标记。
 def issuer_choices():
     """Rank the shared event table; navigation labels are descriptive only."""
+    # CORE LOGIC: STEP 1 — 汇总导航所需事件特征
+    # Input: I有两事件：candidate_count=[1,2], quantity_set=[(q=1.0),(q=1.0,q=2.0)].
+    # Output: multi=[False,True]; size_multi=[False,True]; I: events=2,multi=1,size_multi=1.
+    # Trick: 事件计数与原始重复行数不同；sum布尔值只计事件。
     g = step3_prepared["events"].copy()
     g["issuer"] = g.cusip.map(cusip_issuer).astype("string").fillna("[Missing issuer]")
     g["multi"] = g.candidate_count.gt(1)
@@ -108,9 +146,14 @@ def issuer_choices():
     scores = g.groupby("issuer", observed=True).agg(
         events=("candidate_count", "size"), multi=("multi", "sum"), size_multi=("size_multi", "sum"),
         days=("day", "nunique"), dealers=("firm", "nunique"), gap=("gap", "median"))
+    # CORE LOGIC: STEP 2 — 支持门槛与导航比例
+    # Input: I:events=200,multi=20,days=3,dealers=4; J:events=10,multi=5,days=1,dealers=1.
+    # Output: I rate=0.10且进入supported/multi；J不进入supported。
+    # Trick: 这些门槛只选导航代表，不删训练数据或认定异常。
     scores["rate"] = scores["multi"] / scores["events"]
     supported = scores.loc[scores.events.ge(100) & scores.days.ge(2) & scores.dealers.ge(2)]
     multi = supported.loc[supported.multi.ge(5)]
+    # NAVIGATION LOGIC: 保留已读案例标签，再按指标挑导航入口；不作为模型特征或发生率估计。
     promoted = {}
     for prefix in ["SKY GROUP", "EASTERN GAS", "DUKE ENERGY", "IBM", "EXPAND ENERGY", "HPS CORPORATE", "COMCAST", "MITSUBISHI UFJ"]:
         for name in sorted(issuer_labels.unique()):
@@ -127,8 +170,13 @@ def issuer_choices():
     return [(f"[{promoted[n]}] {n}" if n in promoted else n, n) for n in order]
 
 
+# SETUP LOGIC: asof_features：函数接口；计算阶段见内部CORE标记。
 def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
     """Fast shared summaries plus case slots and fixed-lag composition diagnostics."""
+    # CORE LOGIC: STEP 1 — 合并当前与固定滞后查询
+    # Input: times=[10:30,10:35,10:30] ET同日；LOOKBACK_MIN=30.
+    # Output: requested=[10:30,10:35]; lagged=[10:00,10:05]; queries=[10:00,10:05,10:30,10:35].
+    # Trick: sort/unique/union先去重；同一时间计算一次再映射回用户请求。
     from quote_quality_core import side_features_fast
     requested = pd.DatetimeIndex(times).sort_values().unique()
     lagged = requested - pd.Timedelta(minutes=LOOKBACK_MIN)
@@ -136,16 +184,28 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
     features = side_features_fast(events, queries, age_min)
     base = pd.DataFrame({"time": queries})
     parts = []
+    # CORE LOGIC: STEP 2 — 每dealer向后as-of且不跨日
+    # Input: dealer D事件09:59=60、10:31=70；query10:30和次日10:00.
+    # Output: 10:30匹配09:59；次日匹配被day条件排除；10:31不会用于10:30。
+    # Trick: 先找最新记录再看完整性，不能先删不完整记录而回退旧价。
     for firm, history in events.groupby("firm", observed=True):
         merged = pd.merge_asof(base, history.sort_values(KEYS[-1]), left_on="time", right_on=KEYS[-1], direction="backward")
         merged = merged.loc[merged[KEYS[-1]].notna() & merged.time.dt.normalize().eq(merged.day)].copy()
         if merged.empty:
             continue
+        # CORE LOGIC: STEP 3 — 计算两种age并保留观测历史
+        # Input: query10:30，message10:25,last_change10:10,history_start10:00.
+        # Output: message_age_min=5; spread_set_change_age_min=20; observed_history_min=30；加入parts。
+        # Trick: 首次last_change=NaT时change age为NaN，不能填成message age。
         merged[["complete", "change_age_unknown"]] = merged[["complete", "change_age_unknown"]].astype(bool)
         merged["message_age_min"] = (merged.time - merged[KEYS[-1]]).dt.total_seconds() / 60
         merged["spread_set_change_age_min"] = (merged.time - merged.last_change).dt.total_seconds() / 60
         merged["observed_history_min"] = (merged.time - merged.history_start).dt.total_seconds() / 60
         parts.append(merged)
+    # CORE LOGIC: STEP 4 — 建立查询×dealer矩阵和默认输出
+    # Input: queries=[10:00,10:30], dealers=[D1,D2]；parts含这两个dealer记录。
+    # Output: center/age形状(2,2)，初值NaN；conditions为-1；peer统计初始0/NaN。
+    # Trick: NaN表示未观测；-1是内部条件编码，不能解释为经济数量。
     slots = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=list(events.columns) + ["time", "message_age_min", "spread_set_change_age_min", "observed_history_min"])
     n, dealers = len(queries), pd.Index(events.firm.drop_duplicates())
     d = len(dealers)
@@ -155,6 +215,10 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
     slots["peer_center"], slots["peer_radius"], slots["peer_residual"] = np.nan, np.nan, np.nan
     slots["n_peers"], slots["clipped_candidate_count"] = 0, 0
     slots["clipped_center"], slots["dealer_weight"] = slots["center"], 1.0
+    # CORE LOGIC: STEP 5 — 把完整slot散射到矩阵
+    # Input: slots=[(time10:00,D1,complete=True,center60,age0,q=(2),count1)].
+    # Output: center[0,0]=60; age[0,0]=0; conditions[0,0]=0; fresh[0,0]=True.
+    # Trick: get_indexer产整数坐标；factorize编码(quantity_set,candidate_count)，只比较同一批编码是否相同。
     if len(slots):
         ti, di = queries.get_indexer(slots.time), dealers.get_indexer(slots.firm)
         complete = slots.complete.to_numpy(dtype=bool)
@@ -165,6 +229,10 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
         fresh = np.isfinite(center) & (age <= age_min)
         # Loop over dealers, with all query times handled in arrays. No per-slot
         # DataFrame slicing/iterrows; peers always exclude the target dealer.
+        # CORE LOGIC: STEP 6 — 同行支持排除本dealer
+        # Input: fresh一行=[True,True,True,True]，当前j=0，own_rows=[0].
+        # Output: peer_mask=[False,True,True,True]; counts=[3]; supported=[True].
+        # Trick: peer_mask[:,j]=False是在副本操作，不改变全局fresh；少于3同行跳过影响评估。
         for j in range(d):
             own_rows = np.flatnonzero((di == j) & complete)
             if not len(own_rows):
@@ -175,6 +243,10 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
             counts = peer_mask.sum(axis=1)
             slots.loc[own_rows, "n_peers"] = counts
             supported = counts >= MIN_PEERS
+            # CORE LOGIC: STEP 7 — 稳健同行中心与半径
+            # Input: 3个fresh peers=[59,60,61], own center=80, MIN_PEERS=3.
+            # Output: ref=60,MAD=1,radius=max(10,4×1.4826)=10,residual=20.
+            # Trick: ref[:,None]沿dealer维广播；MAD是价差绝对偏离，不是variance。
             if not supported.any():
                 continue
             idx = own_rows[supported]
@@ -182,17 +254,29 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
             ref = np.nanmedian(peers, axis=1)
             radius = np.maximum(CLIP_FLOOR_BPS, MAD_MULTIPLIER * 1.4826 * np.nanmedian(np.abs(peers - ref[:, None]), axis=1))
             residual = slots.loc[idx, "center"].to_numpy() - ref
+            # CORE LOGIC: STEP 8 — 候选限幅与dealer软权重
+            # Input: candidate_set=(50,80), ref=60,radius=10,residual=5.
+            # Output: middle_low=50,middle_high=80; clipped_center=(50+70)/2=60; weight=1.
+            # Trick: 单调clip后median等于两个中位次序统计量clip后的均值，不需explode全部候选；零residual默认weight1。
             candidate_sets = slots.loc[idx, "spread_set"]
             middle_low = candidate_sets.map(lambda x: x[(len(x) - 1) // 2]).to_numpy()
             middle_high = candidate_sets.map(lambda x: x[len(x) // 2]).to_numpy()
             clipped = (np.clip(middle_low, ref - radius, ref + radius) + np.clip(middle_high, ref - radius, ref + radius)) / 2
             weights = np.minimum(1, np.divide(radius, np.abs(residual), out=np.ones(len(idx)), where=residual != 0))
             slots.loc[idx, ["peer_center", "peer_radius", "peer_residual", "clipped_center", "dealer_weight"]] = np.column_stack([ref, radius, residual, clipped, weights])
+        # CORE LOGIC: STEP 9 — 计受影响候选且恢复slot索引
+        # Input: slot index7:spread_set=(50,80),peer_center=60,peer_radius=10,n_peers=3.
+        # Output: index7 clipped_candidate_count=1（80越界，50在边界）。
+        # Trick: explode复制原slot索引；groupby(level=0)+reindex按原slot对齐，不按候选次序赋值。
         supported = slots.n_peers.ge(MIN_PEERS)
         if supported.any():
             candidates = slots.loc[supported, ["spread_set", "peer_center", "peer_radius"]].explode("spread_set")
             clipped = (pd.to_numeric(candidates.spread_set) - candidates.peer_center).abs().gt(candidates.peer_radius)
             slots.loc[supported, "clipped_candidate_count"] = clipped.groupby(level=0).sum().reindex(slots.index[supported]).to_numpy()
+    # CORE LOGIC: STEP 10 — 对齐当前/滞后聚合和共同dealer
+    # Input: requested=[10:30], lagged=[10:00]; now中心[D1=61,D2=NaN],past=[60,62].
+    # Output: now_present=[True,False],past_present=[True,True],common=[True,False],common_n=1.
+    # Trick: set_axis(requested)把10:00摘要与对应10:30同索引比较，不让pandas按原timestamp相减而全NaN。
     now = features.reindex(requested).copy()
     before = features.reindex(lagged).set_axis(requested)
     ni, pi = queries.get_indexer(requested), queries.get_indexer(lagged)
@@ -200,6 +284,10 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
     now_present, past_present = np.isfinite(center[ni]), np.isfinite(center[pi])
     common = now_present & past_present & same_day[:, None]
     common_n = common.sum(axis=1)
+    # CORE LOGIC: STEP 11 — 分开真实价格变化与组成变化
+    # Input: now D1=61,past D1=60,D2=62；两端同日且均有报价。
+    # Output: composition_changed=True,aggregate_delta=61−61=0,center_delta_30m=NaN,aggregate_delta_30m=0.
+    # Trick: 旧guarded列遇dealer/quantity组成变化置未知；不把组成变化当价格动量。
     eligible = now.n_dealers.gt(0) & before.n_dealers.gt(0) & same_day
     composition_changed = (now_present != past_present).any(axis=1) | ((conditions[ni] != conditions[pi]) & common).any(axis=1)
     now["composition_changed_30m"] = pd.Series(composition_changed, index=requested).astype(float).where(eligible)
@@ -208,6 +296,10 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
     # changes even when quantity support/candidate count changes.
     now["center_delta_30m"] = aggregate_delta.where(~composition_changed)
     now["aggregate_delta_30m"] = aggregate_delta
+    # CORE LOGIC: STEP 12 — 共同dealer差分与两端留存
+    # Input: now=[61,NaN],past=[60,62],common=[True,False],now_n=1,past_n=2,条件D1不变.
+    # Output: common_delta=1; n_common=1; current_retention=1; past_retention=0.5; condition_changed_fraction=0.
+    # Trick: np.divide指定out=NaN和where>0，无共同dealer时保持未知；不是nansum后的假0变化。
     common_difference = np.where(common, center[ni] - center[pi], np.nan)
     now["common_dealer_delta_30m"] = np.divide(np.nansum(common_difference, axis=1), common_n, out=np.full(len(requested), np.nan), where=common_n > 0)
     now["n_common_dealers_30m"] = common_n
@@ -218,28 +310,46 @@ def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
     return slots.loc[slots.time.isin(requested)].reset_index(drop=True), now
 
 
+# SETUP LOGIC: quantity局部诊断接口；不改变原始报价或TRACE口径。
 def quantity_evidence(rows):
     """Same-event quantity contrasts, without equating units to TRACE size."""
+    # CORE LOGIC: STEP 1 — 同事件同quantity取distinct spread摘要
+    # Input: 同timestamp t, q=2 的spreads=[60,60,64].
+    # Output: cells=(t,q=2,lo=60,hi=64,center=62,count=2).
+    # Trick: 中心用unique后的median；重复60不把中心拉成60。
     finite = rows.loc[rows["s"].notna()]
     cells = finite.groupby([KEYS[-1], "qtag"], observed=True).agg(
         lo=("s", "min"), hi=("s", "max"), center=("s", "median"), count=("s", "nunique"),
     ).reset_index()
     # Median of distinct spreads, never frequency-weighted by repeated rows.
     cells["center"] = finite.groupby([KEYS[-1], "qtag"], observed=True)["s"].agg(lambda v: np.median(v.unique())).to_numpy()
+    # CORE LOGIC: STEP 2 — 只在完整且至少两档正quantity的事件比较条件
+    # Input: t1={(q2,s60),(q3,s64)}; t2={(q0,s60),(q3,s64)}，均完整.
+    # Output: eligible[t1]=True,t2=False；positive仅t1两档；counts[t1]=2。
+    # Trick: 这是条件效应可评估集合，不是删除t2原始事件。
     eligible = rows.groupby(KEYS[-1])["qkind"].agg(lambda v: v.eq("Positive").all())
     complete = rows.groupby(KEYS[-1])["s"].agg(lambda v: v.notna().all())
     positive = cells.loc[cells[KEYS[-1]].isin(eligible.index[eligible & complete])]
     counts = positive.groupby(KEYS[-1])["qtag"].nunique()
     positive = positive.loc[positive[KEYS[-1]].isin(counts.index[counts.ge(2)])]
     # Remove any event where a positive size still maps to multiple spreads.
+    # CORE LOGIC: STEP 3 — 每档单价时去共同事件中心
+    # Input: t1:q2→60,q3→64；t2:q2→[60,62],q3→64.
+    # Output: unique仅t1；within_event_residual=[−2,+2]，t2无可辨认的一档一价对照。
+    # Trick: transform(median)广播同事件中心62给两个quantity行。
     unique = positive.groupby(KEYS[-1])["count"].max().eq(1)
     unique = positive.loc[positive[KEYS[-1]].isin(unique.index[unique])].copy()
     unique["within_event_residual"] = unique["center"] - unique.groupby(KEYS[-1])["center"].transform("median")
     return cells, unique
 
 
+# SETUP LOGIC: research_figure：函数接口；计算阶段见内部CORE标记。
 def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas=None):
     """One shared case; all four decisions in a 2x2 dashboard by default."""
+    # CORE LOGIC: STEP 1 — 固定绘图案例的同券同侧同日母集
+    # Input: raw=[(A,bid,03-02,D1),(A,bid,03-02,D2),(B,bid,03-02,D1)], dealer=D1,bond=A.
+    # Output: peers_raw含A的D1/D2；rows只含A的D1；e为D1对应事件，own为D1 slots。
+    # Trick: dealer只筛展示自己的行，不能筛掉对照同行。
     raw = result["raw"]
     mask = raw["cusip"].eq(bond) & raw["side"].eq(side) & raw[KEYS[-1]].dt.normalize().eq(day)
     peers_raw = raw.loc[mask]
@@ -248,6 +358,7 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
     e = g.loc[g["firm"].eq(dealer) & g["cusip"].eq(bond) & g["side"].eq(side) & g["day"].eq(day)]
     slots, f = result["slots"], result["features"]
     own = slots.loc[slots["firm"].eq(dealer)] if len(slots) else slots
+    # PLOTTING LOGIC: 构造标题、同屏子图和可选局部canvas；不重新拟合或改变处理规则。
     summary = (f"Selected dealer: {len(rows):,} raw rows | {len(e):,} events | "
                f"{int(e['candidate_count'].gt(1).sum()):,} multi-spread | "
                f"{int(e['repeats'].sum()):,} repeats | {int(e['bad'].sum()):,} nonfinite spreads")
@@ -284,11 +395,21 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
                                   ("center_delta_30m", "Condition guarded", "#8560A5")]:
             c.plot(f.index, f[col], color=color, label=label, drawstyle="steps-post", lw=1.2)
         c.set_title("Fixed 30min change: common vs full roster"); c.set_ylabel("bps / 30 minutes")
+        # CORE LOGIC: STEP 2 — 检查摘要是否真是原候选
+        # Input: 事件1候选[60,64]→center62,nearest_gap2；事件2候选[60]→center60,gap0.
+        # Output: finite.sum=2,unquoted=1；一半事件的median不是可直接引用的quote。
+        # Trick: 阈值1e-9仅容忍浮点误差，不是价格清洗阈值。
         finite = e["center"].notna()
         unquoted = int(e.loc[finite, "center_nearest_gap"].gt(1e-9).sum())
+        # PLOTTING LOGIC: 把已有诊断数值写进图注，显示量不改变特征。
+        # CORE LOGIC: STEP 3 — 将候选和组成统计写入诊断说明
+        # Input: unquoted=1,finite=[True,True],gap=[4,0],condition_changed=[False,True],history_break=[True,False]；common_n=[1,3],retention=[1,.5],changed_fraction=[0,1]。
+        # Output: 图注显示未报价median 1/2，median gap=2.00bps，变化1/1，median common N=2.0，median retention=75.0%，mean changed=50.0%。
+        # Trick: retention用median，changed fraction用mean；两者分母含义不能混称。
         notes = [f"OBSERVED: median is not a quoted candidate at {unquoted}/{int(finite.sum())} events; median candidate gap {e['gap'].median():.2f} bps.",
                  f"CHECK: {int(e['condition_changed'].sum())}/{int((~e['history_break']).sum())} comparable transitions change quantity support or count. Bounds are order statistics, not tracked streams.",
                  f"USE: common dealers median N={f['n_common_dealers_30m'].median():.1f}; current retention={f['common_retention_30m'].median():.1%}; changed conditions={f['common_condition_changed_fraction_30m'].mean():.1%}. Difference is composition sensitivity, not a causal decomposition. Adjacent-event changes remain in events."]
+    # PLOTTING LOGIC: quantity图布局和原始散点；核心条件对照已在quantity_evidence计算。
     elif view == VIEWS[1]:
         tags = sorted(rows["qtag"].unique())
         if len(tags) <= 6:
@@ -302,11 +423,13 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
             selected = rows.loc[rows["qtag"].eq(qtag)]
             a.scatter(selected[KEYS[-1]], selected["s"], s=20, color="#277F8E", label=f"Selected: {qtag}")
         a.set_title("Levels by raw quantity condition (units unknown)")
+        # CACHEING LOGIC: 同dealer/bond/side/day的quantity诊断只算一次，换选项重画。
         quantity_key = (dealer, bond, side, day)
         diagnostics = result.setdefault("quantity_evidence_cache", {})
         if quantity_key not in diagnostics:
             diagnostics[quantity_key] = quantity_evidence(rows)
         cells, contrasts = diagnostics[quantity_key]
+        # PLOTTING LOGIC: 只高亮所选quantity的已算cells/contrasts，空对照显示Unassessed。
         selected_cells = cells.loc[cells["qtag"].eq(qtag)]
         b.scatter(selected_cells[KEYS[-1]], selected_cells["count"], s=20, color="#8560A5")
         b.set_title(f"Spreads per event: {qtag}"); b.set_ylabel("count"); b.set_ylim(bottom=0)
@@ -319,9 +442,14 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
         else:
             c.scatter(selected_contrasts[KEYS[-1]], selected_contrasts["within_event_residual"], s=20, color="#277F8E")
             c.axhline(0, color="#999999", lw=0.7)
+        # CORE LOGIC: STEP 4 — 统计选中quantity仍多价的事件
+        # Input: selected_cells.count=[1,2,3],qtag=q=2.0；selected_contrasts有1条已确认完整对照。
+        # Output: 图注显示2/3 finite q=2.0 events remain multi-spread，1 eligible contrast；不是2/3 raw rows。
+        # Trick: count已经是同事件distinct spread数，重复行不会加大此发生比例。
         notes = [f"OBSERVED: {int(selected_cells['count'].gt(1).sum())}/{len(selected_cells)} finite {qtag} events remain multi-spread; {len(selected_contrasts)} eligible contrasts.",
                  "ELIGIBLE: complete events, >=2 positive raw quantities, one spread per quantity. Zero/missing size cannot distinguish economic conditions.",
                  "USE: conditional summaries only where mapping repeats with coverage. Else retain pooled candidate ambiguity; no forced size curve."]
+    # PLOTTING LOGIC: 绘已算age规则摘要及覆盖，再单独计算覆盖代价。
     elif view == VIEWS[2]:
         for col, label, color in [("center_equal", "Dealer equal / no expiry", "#555555"),
                                   ("center_decay", f"Half-life {age_min}m", "#277F8E"),
@@ -341,10 +469,15 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
             c.plot(f.index, f[col], color=color, label=label, ls=style, drawstyle="steps-post")
         c.set_title("Coverage and weight concentration"); c.set_ylabel("dealers / effective N")
         c.yaxis.set_major_locator(MaxNLocator(integer=True)); c.set_ylim(bottom=0)
+        # CORE LOGIC: STEP 5 — 量化年龄规则覆盖代价
+        # Input: equal=[60,61],max_age=[60,NaN],decay=[60,62]; own.change_age_unknown=[True,False].
+        # Output: covered=[True,True]（sum=2）,lost=1,unknown=1,max_effect=1 bps。
+        # Trick: 覆盖损失与数值改变量分开；缺失max_age不填成0报价。
         covered = f["center_equal"].notna()
         lost = int((covered & f["center_max_age"].isna()).sum())
         unknown = int(own["change_age_unknown"].sum()) if len(own) else 0
         max_effect = (f["center_decay"] - f["center_equal"]).abs().max()
+        # PLOTTING LOGIC: 把年龄/覆盖结果写成说明；后续分支只绘已有同行支持结果。
         notes = [f"OBSERVED: max-age loses {lost}/{int(covered.sum())} covered grid times; max decay-vs-equal shift {max_effect:.2f} bps. Change age unknown: {unknown}/{len(own)} slots.",
                  "CHECK: low message age can coexist with an unchanged level. Changing dealer contributions can move the aggregate without market repricing.",
                  "USE: retain both ages, coverage and effective N=(sum w)^2/sum(w^2). These age rules remain hypotheses, not calibrated expiry."]
@@ -355,18 +488,31 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
         for col, label, color in [("center_equal", "Dealer equal", "#333333"), ("center_candidate_clip", "Candidate clip", "#C9563D"), ("center_dealer_downweight", "Dealer downweight", "#8560A5")]:
             a.plot(f.index, f[col], label=label, color=color, lw=1.3, drawstyle="steps-post")
         a.set_title("Raw range and alternative aggregates")
+        # CORE LOGIC: STEP 6 — 区分有同行支持和未评估
+        # Input: n_peer_supported=[0,2]；第一个时点只存在baseline fallback。
+        # Output: assessed=[False,True]；第一时点不纳入已评估零影响。
         assessed = f["n_peer_supported"].gt(0)
+        # PLOTTING LOGIC: 设置影响图坐标与分支；数值差分见下一块。
         b.set_title("Impact only where peers support a test"); b.set_ylabel("bps vs baseline")
         if assessed.any():
             for col, label, color in [("center_candidate_clip", "Candidate clip", "#C9563D"), ("center_dealer_downweight", "Dealer downweight", "#8560A5")]:
+                # CORE LOGIC: STEP 7 — 仅在有支持的同时间样本上算变化
+                # Input: center_equal=[60,62],center_candidate_clip=[60,61],assessed=[False,True]，三者index相同。
+                # Output: delta=[NaN,-1] bps；第一行fallback相等不伪装成实测0。
+                # Trick: Series相减按时间index对齐；where把未评估行留缺口。
                 delta = (f[col] - f["center_equal"]).where(assessed)
+                # PLOTTING LOGIC: 画已经过资格mask的变化曲线；不连接未知区间。
                 b.plot(f.index, delta, color=color, label=label, marker=".", ms=3, drawstyle="steps-post")
             b.axhline(0, color="#888888", lw=0.6)
         else:
             b.text(0.5, 0.5, "NOT ASSESSED\nInsufficient fresh peers\nBaseline fallback is not a measured zero", transform=b.transAxes, ha="center", va="center", fontsize=9.5)
             b.set_yticks([])
+        # CORE LOGIC: STEP 8 — 选完整且有足够同行的残差母集
+        # Input: own rows=(complete=True,n_peers=3),(True,2),(False,4)；MIN_PEERS=3。
+        # Output: comparable为前两行；supported仅第一行；不完整第三行不作为可比中心。
         comparable = own.loc[own["complete"]] if len(own) else own
         supported = comparable.loc[comparable["n_peers"].ge(MIN_PEERS)] if len(comparable) else comparable
+        # PLOTTING LOGIC: 绘原候选相对同行的区间，保留无支持缺口。
         c.set_title("Selected candidates vs other dealers"); c.set_ylabel("bps vs peer median")
         if len(supported):
             # NaN entries preserve gaps instead of connecting unsupported times.
@@ -379,8 +525,13 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
         else:
             c.text(0.5, 0.5, f"Need >= {MIN_PEERS} fresh other dealers\nNo candidate residual can be assessed", transform=c.transAxes, ha="center", va="center", fontsize=9.5)
             c.set_yticks([])
+        # CORE LOGIC: STEP 9 — 区分候选变化与中心变化
+        # Input: assessed=[True,True],n_clipped_dealers=[1,1],n_changed_centers=[0,1].
+        # Output: affected=2,centers=1；两次clip仅一次改变聚合中心。
+        # Trick: 只在真实supported状态计数，fallback不算已评估的零影响。
         affected = int(f.loc[assessed, "n_clipped_dealers"].gt(0).sum())
         centers = int(f.loc[assessed, "n_changed_centers"].gt(0).sum())
+        # PLOTTING LOGIC: 支持/阈值图注与时间轴格式；四个问题共用原结果。
         notes = [f"SUPPORT: selected dealer {len(supported)}/{len(comparable)} complete slots; any dealer assessed {int(assessed.sum())}/{int(f['n_dealers'].gt(0).sum())} covered times. Candidate/center changes: {affected}/{centers} of {int(assessed.sum())} assessed times.",
                  f"RULE: >=3 other dealers aged <= {age_min}m; radius=max(10bps, 4 x 1.4826 x peer MAD). Unsupported comparisons stay unassessed.",
                  "USE: separate no support, assessed/no change, and assessed/change. Peer agreement is not truth; clipping candidates can leave their median unchanged."]
@@ -424,6 +575,7 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
 # Full-day plots / case rankings are retrospective displays; neither is a feature or a claim of predictive success.
 
 # %% 3. Choose a case; compare rules; save one PNG
+# UI LOGIC: 旧控件解绑与初始化；未Apply选项不是结果。
 if "step3_controls" in globals():
     for control in step3_controls:
         control.unobserve_all("value")
@@ -448,10 +600,12 @@ step3_image = widgets.Image(format="png", layout=widgets.Layout(width="100%", ma
 step3_result, step3_features, step3_figure, step3_busy, step3_cache_key = None, pd.DataFrame(), None, False, None
 
 
+# CACHEING LOGIC: 缓存键包括issuer/bond/side/day/age；dealer/quantity/layout不进入计算键。
 def step3_key():
     return (step3_issuer.value, step3_bond.value, step3_side.value, step3_day.value, step3_age.value)
 
 
+# CACHEING LOGIC: 仅切已有共享事件表，保留issuer子表用于反复绘图。
 def step3_issuer_result():
     global step3_result
     if step3_result is None or step3_result["issuer"] != step3_issuer.value:
@@ -464,6 +618,7 @@ def step3_issuer_result():
                             unkeyed=int((~valid).sum()), issuer=step3_issuer.value, quantity_evidence_cache={})
 
 
+# NAVIGATION LOGIC: 同步导航选项；不创建事件或运行as-of。
 def sync_step3_selectors(reset=False):
     """Cheap event-table navigation; never constructs events or as-of features."""
     step3_issuer_result()
@@ -489,6 +644,7 @@ def sync_step3_selectors(reset=False):
     return eligible
 
 
+# PLOTTING LOGIC: 仅绘已Apply的缓存结果；未Apply的选项不会冒充结果。
 def draw_step3():
     global step3_figure, step3_features
     step3_quantity.layout.display = "" if step3_view.value in [ALL_VIEWS, VIEWS[1]] else "none"
@@ -508,6 +664,7 @@ def draw_step3():
     step3_status.value = f"Shared event table; cached bond/side/day state. As-of + detail calculation {step3_result['asof_seconds']:.3f}s. All four sections save together; raw source stays in bcq_df."
 
 
+# UI LOGIC: 控件回调busy guard，结束后恢复响应。
 def selection_changed_step3(change=None):
     global step3_busy
     if step3_busy:
@@ -520,6 +677,7 @@ def selection_changed_step3(change=None):
         step3_busy = False
 
 
+# UI LOGIC: Apply回调、空案例展示和异常后busy恢复。
 def refresh_step3(change=None):
     global step3_result, step3_features, step3_figure, step3_busy, step3_cache_key
     if step3_busy:
@@ -539,15 +697,21 @@ def refresh_step3(change=None):
                 step3_image.value = buffer.getvalue()
             step3_status.value = "No keyed events; no numeric aggregation was run."
             return
+        # CACHEING LOGIC: 命中同bond/side/day/age时复用已有slot结果。
         key = step3_key()
         if key not in step3_case_cache:
             step3_status.value = "Building this bond / side / ET day state once..."
             started = perf_counter()
+            # CORE LOGIC: STEP 1 — 仅构建本次bond/side/day查询网格
+            # Input: A/bid当日报价首10:01、末10:12；GRID=5min.
+            # Output: times=[10:01,10:05,10:10,10:12]；只对本案例调用asof_features。
+            # Trick: union补首末真实时间；该网格不是全天覆盖分母。
             e = step3_result["events"]
             history = e.loc[e.cusip.eq(step3_bond.value) & e.side.eq(step3_side.value) & e.day.eq(step3_day.value)]
             today = history[KEYS[-1]]
             times = pd.date_range(today.min().ceil(GRID), today.max().floor(GRID), freq=GRID).union(pd.DatetimeIndex([today.min(), today.max()]))
             slots, features = asof_features(history, times, step3_age.value)
+            # CACHEING LOGIC: 保存局部计算及时长；随后draw只重画，不重算事件。
             step3_case_cache[key] = dict(slots=slots, features=features, asof_seconds=perf_counter() - started)
         step3_result.update(step3_case_cache[key])
         step3_cache_key = key
@@ -557,6 +721,7 @@ def refresh_step3(change=None):
         step3_busy = False
 
 
+# NAVIGATION LOGIC: 用户显式冻结时建立群体与案例；已冻结名单保留。
 def freeze_step3_cases(_=None):
     global step3_population, step3_manifest, step3_busy
     if step3_busy:
@@ -580,6 +745,7 @@ def freeze_step3_cases(_=None):
         step3_busy = False
 
 
+# NAVIGATION LOGIC: 应用固定名单中的同一案例和显示选项。
 def choose_fixed_step3(change=None):
     global step3_busy
     if step3_busy or step3_case.value is None:
@@ -600,6 +766,7 @@ def choose_fixed_step3(change=None):
     refresh_step3()
 
 
+# FILE IO LOGIC: 导出同屏完整PNG；不打印大表或改变feature。
 def save_step3(change=None):
     if step3_busy or step3_save.disabled or step3_key() != step3_cache_key:
         return
@@ -611,6 +778,7 @@ def save_step3(change=None):
     export.savefig(path, dpi=180, facecolor="white")
     step3_status.value = f"Saved: {path}"
 
+# UI LOGIC: 绑定回调并展示；保持原Apply行为。
 step3_controls = [step3_issuer, step3_view, step3_dealer, step3_bond, step3_side, step3_day, step3_quantity, step3_age, step3_case]
 for box in [step3_issuer, step3_dealer, step3_bond, step3_side, step3_day, step3_age]:
     box.observe(selection_changed_step3, names="value")

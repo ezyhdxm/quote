@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Cache equivalence, absent versus incomplete state, and same-slot pairing diagnostics."""
 from pathlib import Path
 import sys
@@ -14,6 +15,7 @@ from tests import test_quality_step45 as test45
 raw, T = test45.raw, test45.T
 
 
+# TEST FIXTURE LOGIC: direct_reference；仅用于复现输入或核对行为。
 def direct_reference(quotes, queries, **kwargs):
     """Original per-bond full route, independent of the optimized query eligibility."""
     rows = []
@@ -31,7 +33,9 @@ def direct_reference(quotes, queries, **kwargs):
     return pd.concat(rows, ignore_index=True).set_index('row_id').reindex(queries.row_id).reset_index()
 
 
+# TEST LOGIC: QuoteCacheChecks；仅用于复现输入或核对行为。
 class QuoteCacheChecks(unittest.TestCase):
+    # TEST LOGIC: test_narrow_events_preserve_full_row_repeat_semantics；仅用于复现输入或核对行为。
     def test_narrow_events_preserve_full_row_repeat_semantics(self):
         quotes = raw([(0,'A','bid',100,2),(0,'A','bid',100,2),(1,'A','bid',np.nan,2)])
         quotes['source_detail'] = ['first', 'different', 'incomplete']
@@ -43,6 +47,7 @@ class QuoteCacheChecks(unittest.TestCase):
         self.assertEqual(narrow['events'].repeats.tolist(), [1, 0])
         self.assertEqual(set(narrow['timings']), {'normalize_s','aggregate_s','history_s'})
 
+    # TEST LOGIC: test_fast_route_matches_original_for_empty_days_and_incomplete_latest；仅用于复现输入或核对行为。
     def test_fast_route_matches_original_for_empty_days_and_incomplete_latest(self):
         quotes = raw([(0,'A','bid',105,0),(0,'A','ask',100,0),
                       (2,'A','bid',np.nan,2),(1440,'B','bid',110,2)])
@@ -59,6 +64,7 @@ class QuoteCacheChecks(unittest.TestCase):
         self.assertEqual(incomplete.loc[4,'bcq_bid_n_dealers'], 0)
         self.assertTrue(pd.isna(incomplete.loc[4,'bcq_pair_gap']))
 
+    # TEST LOGIC: test_no_state_queries_skip_dealer_and_pair_calculations；仅用于复现输入或核对行为。
     def test_no_state_queries_skip_dealer_and_pair_calculations(self):
         quotes = raw([(0,'A','bid',105,2),(0,'A','ask',100,2)])
         queries = pd.DataFrame(dict(row_id=[1,2,3], cusip=['X','X','ABSENT'],
@@ -74,7 +80,9 @@ class QuoteCacheChecks(unittest.TestCase):
         self.assertEqual(result.attrs['quote_feature_timings']['no_state_unique_queries'], 3)
 
 
+# TEST LOGIC: SameSlotChecks；仅用于复现输入或核对行为。
 class SameSlotChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: setUp；仅用于复现输入或核对行为。
     def setUp(self):
         self.quotes = raw([(0,'A','bid',70,0),(0,'A','ask',100,0),
             (0,'B','bid',90,2),(0,'B','bid',110,5),(0,'B','ask',100,2),(0,'B','ask',200,99),
@@ -82,6 +90,7 @@ class SameSlotChecks(unittest.TestCase):
         self.events = qc.prepare_quote_events(self.quotes)['events']
         self.times = pd.DatetimeIndex([T,T+pd.Timedelta(minutes=20),T+pd.Timedelta(minutes=40)])
 
+    # TEST LOGIC: test_masks_from_cached_state_equal_fresh_asof_at_each_policy；仅用于复现输入或核对行为。
     def test_masks_from_cached_state_equal_fresh_asof_at_each_policy(self):
         cached = qc.pair_snapshots(self.events, self.times)
         for age, sync in [(10,0),(30,1),(60,5)]:
@@ -89,6 +98,7 @@ class SameSlotChecks(unittest.TestCase):
             expected = qc.pair_snapshots(self.events, self.times, age, sync)
             pd.testing.assert_frame_equal(actual, expected)
 
+    # TEST LOGIC: test_abc_keeps_b_c_slots_equal_and_allows_matching_to_increase_crossing；仅用于复现输入或核对行为。
     def test_abc_keeps_b_c_slots_equal_and_allows_matching_to_increase_crossing(self):
         pairs = qc.pair_snapshots(self.events, [T])
         result = qc.pair_policy_comparison(pairs)
@@ -99,6 +109,7 @@ class SameSlotChecks(unittest.TestCase):
         self.assertNotEqual(result.iloc[1].gap_mean_bps, result.iloc[2].gap_mean_bps)
         self.assertEqual(len(pairs), 3)  # diagnostic never deletes unknown quantities
 
+    # TEST LOGIC: test_extreme_provenance_keeps_quantities_and_deduplicates_grid_state；仅用于复现输入或核对行为。
     def test_extreme_provenance_keeps_quantities_and_deduplicates_grid_state(self):
         pairs = qc.pair_snapshots(self.events, self.times)
         sources = qc.pair_extreme_sources(self.quotes, pairs, limit_each=1)
@@ -108,6 +119,7 @@ class SameSlotChecks(unittest.TestCase):
         self.assertEqual(set(zip(high.side, high.spread, high.quantity)), {('bid',110,5),('ask',100,2)})
         self.assertEqual(len(sources), 8)  # all four B raw candidates for each extreme once
 
+    # TEST LOGIC: test_dealer_change_only_renders_and_apply_reuses_bond_day_state；仅用于复现输入或核对行为。
     def test_dealer_change_only_renders_and_apply_reuses_bond_day_state(self):
         state = test45.NotebookChecks().load(4)
         cached_pairs = next(iter(state['step4_pair_cache'].values()))['pairs']
@@ -123,6 +135,7 @@ class SameSlotChecks(unittest.TestCase):
         self.assertIs(next(iter(state['step4_pair_cache'].values()))['pairs'], cached_pairs)
         self.assertTrue(bytes(state['step4_image'].value).startswith(b'\x89PNG'))
 
+    # TEST LOGIC: test_freeze_is_explicit_once_and_keeps_same_case_ids；仅用于复现输入或核对行为。
     def test_freeze_is_explicit_once_and_keeps_same_case_ids(self):
         with patch.object(qp, 'fixed_case_manifest', wraps=qp.fixed_case_manifest) as freeze:
             state = test45.NotebookChecks().load(4)

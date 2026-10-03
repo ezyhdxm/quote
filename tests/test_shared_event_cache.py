@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Persistent event reuse preserves exact candidate/history/duplicate semantics."""
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ import quote_quality_core as core
 import quote_quality_cache as cache
 
 
+# TEST FIXTURE LOGIC: raw；仅用于复现输入或核对行为。
 def raw():
     t = pd.Timestamp('2026-03-02 10:00', tz='America/New_York')
     q = pd.DataFrame([dict(firm='A', cusip='X', side='bid', quantity=size, spread=spread,
@@ -18,9 +20,12 @@ def raw():
     return pd.concat([q, q.iloc[:1]], ignore_index=True)
 
 
+# TEST LOGIC: SharedCacheChecks；仅用于复现输入或核对行为。
 class SharedCacheChecks(unittest.TestCase):
+    # TEST LOGIC: test_cache_progress_identifies_identity_compute_encode_write_and_decode；仅用于复现输入或核对行为。
     def test_cache_progress_identifies_identity_compute_encode_write_and_decode(self):
         messages = []
+        # TEST FIXTURE LOGIC: progress；仅用于复现输入或核对行为。
         def progress(stage, done, total, detail):
             messages.append(detail)
         with tempfile.TemporaryDirectory() as folder:
@@ -36,6 +41,7 @@ class SharedCacheChecks(unittest.TestCase):
             self.assertFalse(any('Aggregating' in m for m in messages))
             self.assertGreaterEqual(second['timings']['cache_decode_s'], 0)
 
+    # TEST LOGIC: test_roundtrip_reuses_and_keeps_exact_nanosecond_sets；仅用于复现输入或核对行为。
     def test_roundtrip_reuses_and_keeps_exact_nanosecond_sets(self):
         q = raw()
         with tempfile.TemporaryDirectory() as folder:
@@ -48,6 +54,7 @@ class SharedCacheChecks(unittest.TestCase):
             self.assertFalse(first['events'].iloc[1].complete)
             self.assertEqual(len(second['events']), 3)
 
+    # TEST LOGIC: test_source_code_and_corrupt_cache_invalidate；仅用于复现输入或核对行为。
     def test_source_code_and_corrupt_cache_invalidate(self):
         q = raw()
         with tempfile.TemporaryDirectory() as folder:
@@ -64,6 +71,7 @@ class SharedCacheChecks(unittest.TestCase):
                 fourth = cache.prepare_quote_events(q, cache_dir=folder)
             self.assertNotEqual(first['cache_key'], fourth['cache_key'])
 
+    # TEST LOGIC: test_metadata_that_changes_repeat_count_invalidates；仅用于复现输入或核对行为。
     def test_metadata_that_changes_repeat_count_invalidates(self):
         q = raw()
         with tempfile.TemporaryDirectory() as folder:

@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Same-target SECTOR review must not retrain or open locked test."""
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ import pandas as pd
 import quote_quality_saved as saved
 
 
+# TEST FIXTURE LOGIC: fixture；仅用于复现输入或核对行为。
 def fixture():
     times = pd.date_range('2026-03-19 10:00', periods=6, freq='12h', tz='America/New_York')
     f = pd.DataFrame(dict(row_id=range(6), time=times, split='Validation',
@@ -26,7 +28,9 @@ def fixture():
     return f, pd.concat(parts, ignore_index=True)
 
 
+# TEST LOGIC: SavedValidationChecks；仅用于复现输入或核对行为。
 class SavedValidationChecks(unittest.TestCase):
+    # TEST LOGIC: test_target_sector_and_identical_row_deltas；仅用于复现输入或核对行为。
     def test_target_sector_and_identical_row_deltas(self):
         f, p = fixture()
         r = saved.sector_diagnostics(f, p, 'Quote levels')
@@ -38,6 +42,7 @@ class SavedValidationChecks(unittest.TestCase):
         self.assertEqual(r['n'], 6)
         self.assertEqual(saved.sector_diagnostics(f, p, 'Reliability')['reference'], 'Quote levels')
 
+    # TEST LOGIC: test_unequal_rows_duplicate_stale_time_and_wrong_target_are_rejected；仅用于复现输入或核对行为。
     def test_unequal_rows_duplicate_stale_time_and_wrong_target_are_rejected(self):
         f, p = fixture()
         for bad in [p.iloc[1:], pd.concat([p, p.iloc[:1]])]:
@@ -51,6 +56,7 @@ class SavedValidationChecks(unittest.TestCase):
         with self.assertRaises(ValueError): saved.validation_rows(f, p.drop(columns='error_bps'))
         with self.assertRaises(ValueError): saved.validation_rows(f, p.assign(abs_error_bps=-1.))
 
+    # TEST LOGIC: test_load_reads_validation_only_and_checks_dates；仅用于复现输入或核对行为。
     def test_load_reads_validation_only_and_checks_dates(self):
         f, p = fixture()
         with tempfile.TemporaryDirectory() as temp:
@@ -69,6 +75,7 @@ class SavedValidationChecks(unittest.TestCase):
             (folder / 'experiment.json').write_text(json.dumps(manifest))
             with self.assertRaises(ValueError): saved.load_saved_validation(folder)
 
+    # TEST LOGIC: test_complete_png_without_large_table；仅用于复现输入或核对行为。
     def test_complete_png_without_large_table(self):
         f, p = fixture()
         result = saved.sector_diagnostics(f, p)
@@ -77,6 +84,7 @@ class SavedValidationChecks(unittest.TestCase):
             saved.sector_figure(result).savefig(path)
             self.assertGreater(path.stat().st_size, 1000)
 
+    # TEST LOGIC: test_trade_rule_queries_keep_absence_and_mask_unsupported_fallback；仅用于复现输入或核对行为。
     def test_trade_rule_queries_keep_absence_and_mask_unsupported_fallback(self):
         import quote_quality_core as core
         f, _ = fixture()
@@ -99,7 +107,9 @@ class SavedValidationChecks(unittest.TestCase):
             saved.trade_rule_figure(result).savefig(Path(temp) / 'rule_effects.png')
 
 
+# TEST LOGIC: Step5CheckpointChecks；仅用于复现输入或核对行为。
 class Step5CheckpointChecks(unittest.TestCase):
+    # TEST LOGIC: test_unsaved_and_frame_only_are_clear_and_never_train_or_read_test；仅用于复现输入或核对行为。
     def test_unsaved_and_frame_only_are_clear_and_never_train_or_read_test(self):
         frame, _ = fixture()
         with tempfile.TemporaryDirectory() as temp:
@@ -114,6 +124,7 @@ class Step5CheckpointChecks(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'no completed validation'):
                     saved.load_saved_validation(folder)
 
+    # TEST LOGIC: test_round_trip_preserves_metadata_sector_and_existing_flat_export；仅用于复现输入或核对行为。
     def test_round_trip_preserves_metadata_sector_and_existing_flat_export(self):
         frame, predictions = fixture()
         with tempfile.TemporaryDirectory() as temp:
@@ -139,6 +150,7 @@ class Step5CheckpointChecks(unittest.TestCase):
             self.assertEqual(manifest['split_dates']['Validation'], sorted(frame.time.dt.strftime('%Y-%m-%d').unique()))
             self.assertEqual(set(manifest['validation_files_sha256']), {'model_features.parquet', 'validation_predictions.parquet'})
 
+    # TEST LOGIC: test_validation_restore_never_reads_or_checks_test_predictions；仅用于复现输入或核对行为。
     def test_validation_restore_never_reads_or_checks_test_predictions(self):
         frame, predictions = fixture()
         with tempfile.TemporaryDirectory() as temp:
@@ -157,6 +169,7 @@ class Step5CheckpointChecks(unittest.TestCase):
                              ['model_features.parquet', 'validation_predictions.parquet'])
             self.assertNotIn('test_predictions.parquet', [Path(call.args[0]).name for call in digest.call_args_list])
 
+    # TEST LOGIC: test_interrupted_write_keeps_previous_pointer_and_snapshot_usable；仅用于复现输入或核对行为。
     def test_interrupted_write_keeps_previous_pointer_and_snapshot_usable(self):
         frame, predictions = fixture()
         with tempfile.TemporaryDirectory() as temp:
@@ -165,6 +178,7 @@ class Step5CheckpointChecks(unittest.TestCase):
             pointer = (folder / 'latest.json').read_bytes()
             files = {p.name: p.read_bytes() for p in previous.iterdir()}
             real_write = pd.DataFrame.to_parquet
+            # TEST FIXTURE LOGIC: interrupt；仅用于复现输入或核对行为。
             def interrupt(source, path, *args, **kwargs):
                 if Path(path).name == 'validation_predictions.parquet':
                     raise KeyboardInterrupt('simulated write interruption')
@@ -184,6 +198,7 @@ class Step5CheckpointChecks(unittest.TestCase):
             self.assertFalse(list(folder.glob('.latest-*.json')))
             saved.load_saved_validation(folder)
 
+    # TEST LOGIC: test_first_interruption_does_not_publish_a_pointer；仅用于复现输入或核对行为。
     def test_first_interruption_does_not_publish_a_pointer(self):
         frame, predictions = fixture()
         with tempfile.TemporaryDirectory() as temp:
@@ -195,6 +210,7 @@ class Step5CheckpointChecks(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, 'No saved Step5 checkpoint/export'):
                 saved.load_saved_validation(folder)
 
+    # TEST LOGIC: test_missing_and_wrong_snapshot_checksums_are_rejected；仅用于复现输入或核对行为。
     def test_missing_and_wrong_snapshot_checksums_are_rejected(self):
         frame, predictions = fixture()
         for mutation in ['manifest', 'missing', 'wrong']:
@@ -219,6 +235,7 @@ class Step5CheckpointChecks(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'checksum|checksums'):
                         saved.load_saved_validation(folder)
 
+    # TEST LOGIC: test_bad_snapshot_path_and_missing_data_do_not_fall_back；仅用于复现输入或核对行为。
     def test_bad_snapshot_path_and_missing_data_do_not_fall_back(self):
         frame, predictions = fixture()
         with tempfile.TemporaryDirectory() as temp:
@@ -234,6 +251,7 @@ class Step5CheckpointChecks(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, 'validation file is missing'):
                 saved.load_saved_validation(folder)
 
+    # TEST LOGIC: test_metadata_restores_lock_without_validation_or_any_parquet_access；仅用于复现输入或核对行为。
     def test_metadata_restores_lock_without_validation_or_any_parquet_access(self):
         frame, predictions = fixture()
         for completed in [False, True]:
@@ -259,6 +277,7 @@ class Step5CheckpointChecks(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'checksum'):
                     saved.load_step5_metadata(folder)
 
+    # TEST LOGIC: test_metadata_old_flat_lock_works_without_prediction_files；仅用于复现输入或核对行为。
     def test_metadata_old_flat_lock_works_without_prediction_files(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

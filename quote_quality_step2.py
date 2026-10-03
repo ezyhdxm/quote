@@ -7,6 +7,7 @@
 # Start with Global; scope changes apply once. Freeze 18 cases once for stable navigation.
 
 # %% 1. Load data — same paths and cache logic as step 1
+# SETUP LOGIC: STEP 1 — Import notebook dependencies and retain existing data paths
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -22,12 +23,17 @@ BENCHMARK_CSV = Path("data/pipeline/DailyCloseUSTBenchmarks.csv_20260506")
 RAW_QUOTES_FILE = Path("data/bondcliq/quotes_pretrade_260301_260401_Wells_quotes2.parquet")
 DATA_IG_CACHE = Path("data/pipeline/data_ig.parquet")
 
+# SETUP LOGIC: Declare to_ny_datetime; existing arguments and docstring are preserved
 def to_ny_datetime(series):
+    # CORE LOGIC: STEP 1 — Normalize trade timestamps to known ET dates
+    # Input: series=['2026-03-02 10:00'] naive or ['2026-03-02 15:00+00:00'] aware
+    # Output: both represent 2026-03-02 10:00:00-05:00 after ET normalization
     values = pd.to_datetime(series, errors="coerce", format="mixed")
     if values.dt.tz is None:
         return values.dt.tz_localize("America/New_York")
     return values.dt.tz_convert("America/New_York")
 
+# CACHEING LOGIC: STEP 2 — Reuse the existing three-month TRACE cache or build it through the established loader
 if DATA_IG_CACHE.exists():
     data_ig = pd.read_parquet(DATA_IG_CACHE)
 else:
@@ -40,12 +46,17 @@ else:
     DATA_IG_CACHE.parent.mkdir(parents=True, exist_ok=True)
     data_ig.to_parquet(DATA_IG_CACHE, index=False)
 
+# FILE IO LOGIC: STEP 3 — Read source quotes and convert their known UTC timestamps to ET
 bcq_df = pd.read_parquet(RAW_QUOTES_FILE)
 bcq_df["quote_timestamp_ET"] = pd.to_datetime(
     bcq_df["quote_timestamp_UTC"], utc=True, errors="coerce", format="mixed",
 ).dt.tz_convert("America/New_York")
+# SETUP LOGIC: STEP 4 — Import shared population summaries and deterministic case navigation
 from quote_quality_population import (population_tables, scope_selection, scope_options, summary_html,
                                       fixed_case_manifest)
+# CORE LOGIC: STEP 1 — Build reusable full population tables with shared prepared events
+# Input: traded bonds X,Y; quotes only X with zero and missing quantities
+# Output: universe retains X,Y; Global no_quote_bonds=1; event/raw/unit denominators stay separate
 quality_population = population_tables(data_ig, bcq_df)
 bcq_df = quality_population["raw"]
 
@@ -62,13 +73,18 @@ bcq_df = quality_population["raw"]
 # Quantity units remain unknown; zero quantity is not zero spread. Raw records are retained.
 
 # %% 2. Analyze one issuer and define the overview and case figures
+# SETUP LOGIC: STEP 6 — Declare exact event keys, quantity classes, colors and page size
 KEYS = ["firm", "cusip", "side", "quote_timestamp_ET"]
 QKINDS = ["Same positive", "Different positive", "Contains zero", "Missing / other"]
 QCOLORS = ["#287D8E", "#7656A8", "#D98B20", "#A25367"]
 DEALERS_PER_PAGE = 8
 issuer_labels = bcq_df["ISSUER"].astype("string").fillna("[Missing issuer]")
 
+# SETUP LOGIC: Declare group_quotes; existing arguments and docstring are preserved
 def group_quotes(raw, keys=KEYS, count_repeats=True):
+    # CORE LOGIC: STEP 1 — Validate event keys and create finite numeric views
+    # Input: firm=['A',''], both cusip='X', side='bid'; spread=[95,float('inf')], quantity=[2,None]
+    # Output: valid_key=[True,False], s=[95,NaN], q=[2,NaN]; raw rows are preserved
     q = raw[keys + ["spread", "quantity"]].copy()
     valid_key = q[keys].notna().all(axis=1)
     for column in keys[:-1]:
@@ -77,6 +93,10 @@ def group_quotes(raw, keys=KEYS, count_repeats=True):
     quantity = pd.to_numeric(q["quantity"], errors="coerce").to_numpy(float, na_value=np.nan)
     q["s"] = np.where(np.isfinite(spread), spread, np.nan)
     q["q"] = quantity
+    # CORE LOGIC: STEP 2 — Classify quantity states and retain incomplete spreads
+    # Input: quantity=[0,2,None,-1,'bad']; spread=[95,96,97,98,None]
+    # Output: qkind=['Zero','Positive','Missing','Other','Other']; positive_q=[NaN,2,NaN,NaN,NaN]; bad_spread flags final row
+    # Trick: Unknown conditions are flags, not automatic deletions.
     q["qkind"] = np.select(
         [q["quantity"].isna(), np.isfinite(quantity) & (quantity == 0),
          np.isfinite(quantity) & (quantity > 0)],
@@ -88,6 +108,10 @@ def group_quotes(raw, keys=KEYS, count_repeats=True):
     q["bad_spread"] = q["s"].isna()
     # Ranking needs only narrow group statistics; exact content repeats are
     # checked across every loaded field only for the selected issuer.
+    # CORE LOGIC: STEP 3 — Aggregate exact event rows and repeat identity
+    # Input: one A/X/bid timestamp contains [(95,2),(98,2),(98,2)] with final row identical in all source fields
+    # Output: rows=3, repeats=1, n_spreads=2, lo=95, hi=98, n_quantity=1, all_zero=False
+    # Trick: Repeat equality checks every loaded field only when count_repeats is enabled.
     q["duplicate"] = raw.duplicated().to_numpy() if count_repeats else False
     groups = q.loc[valid_key].groupby(keys, sort=False, observed=True).agg(
         rows=("s", "size"), repeats=("duplicate", "sum"),
@@ -96,6 +120,10 @@ def group_quotes(raw, keys=KEYS, count_repeats=True):
         all_zero=("zero", "all"), has_unknown=("unknown", "any"),
         bad_spreads=("bad_spread", "sum"),
     ).reset_index()
+    # CORE LOGIC: STEP 4 — Derive simultaneous gap, quantity class and retained diagnostics
+    # Input: event lo=95, hi=98, n_spreads=2, has_unknown=False, has_zero=False, n_quantity=1
+    # Output: range_bps=3, multi=True, qclass='Same positive'; event day is ET midnight
+    # Trick: A same-timestamp gap is candidate disagreement, not a time-series move or crossing.
     groups["range_bps"] = groups["hi"] - groups["lo"]
     groups["multi"] = groups["n_spreads"].ge(2)
     groups["qclass"] = np.select(
@@ -107,7 +135,11 @@ def group_quotes(raw, keys=KEYS, count_repeats=True):
             "unkeyed_rows": int((~valid_key).sum()), "repeated_rows": int(q["duplicate"].sum()),
             "bad_spread_rows": int(q["bad_spread"].sum())}
 
+# SETUP LOGIC: Declare analyze_scope; existing arguments and docstring are preserved
 def analyze_scope(scope="Global", value=None):
+    # CORE LOGIC: STEP 1 — Reuse scope groups while preserving raw-row alignment
+    # Input: scope='Dealer',value='A'; selected source index 7=(A,X,bid,10:00,spread='95',quantity=0), index 9=(A,X,ask,10:01,spread='bad',quantity=None); classified kinds=['Zero','Missing']
+    # Output: raw indices=[7,9]; q s=[95,NaN], q=[0,NaN], qkind=['Zero','Missing']; scope groups are reused unchanged
     selection = scope_selection(quality_population, scope, value)
     classified, groups = selection["raw"], selection["groups"]
     raw = quality_population["raw"].loc[classified.index]
@@ -115,6 +147,9 @@ def analyze_scope(scope="Global", value=None):
     q["s"] = pd.to_numeric(q["spread"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     q["q"] = pd.to_numeric(q["quantity"], errors="coerce")
     q["qkind"] = classified["quantity_kind"]
+    # CORE LOGIC: STEP 2 — Retain unkeyed/incomplete counts and unit-equal rates
+    # Input: q has valid rows (A,X,bid,Mar2 10:00,s=95) and (A,X,bid,Mar2 10:00,s=98), plus a blank-firm row with s=NaN; summary has one affected dealer/bond/side/day, unit_equal_multi_rate=1
+    # Output: returned quotes has the 2 valid rows; unkeyed_rows=1, bad_spread_rows=1, day_count=1, day_balanced_rate=1, affected_day_rate=1
     valid = q[KEYS].notna().all(axis=1)
     for key in KEYS[:-1]:
         valid &= q[key].astype("string").str.strip().ne("").fillna(False)
@@ -125,11 +160,17 @@ def analyze_scope(scope="Global", value=None):
                 day_balanced_rate=summary.unit_equal_multi_rate,
                 affected_day_rate=summary.affected_unit_rate, day_count=int(summary.dealer_bond_side_days))
 
+# SETUP LOGIC: Declare analyze_issuer; existing arguments and docstring are preserved
 def analyze_issuer(issuer):
+    # CORE LOGIC: STEP 1 — Retain issuer drill-down on the same population tables
+    # Input: issuer='Acme'; population Issuer Acme contains 2 raw X rows and 1 multi event; summary events=1,multi_events=1
+    # Output: result scope='Issuer', value='Acme', raw row count=2, group count=1; summary multi_event_rate=1; no new history
     return analyze_scope("Issuer", issuer)
 
+# SETUP LOGIC: Declare representative_issuers; existing arguments and docstring are preserved
 def representative_issuers():
     # All traded issuers, including quote-absent ones; fixed cases are separate.
+    # UI LOGIC: STEP 1 — Expose every traded issuer and label existing summary fields for navigation
     summary = quality_population["tables"]["Issuer"].copy()
     summary["groups"], summary["multi"] = summary.events, summary.multi_events
     summary["balanced_rate"] = summary.unit_equal_multi_rate
@@ -138,7 +179,11 @@ def representative_issuers():
     return [(str(name), name) for name in summary.index], summary
 
 
+# SETUP LOGIC: Declare overview_figure; existing arguments and docstring are preserved
 def overview_figure(result, page=1):
+    # CORE LOGIC: STEP 1 — Count dealer multi-spread events and choose a display page
+    # Input: dealer A multi=[True,False], dealer B=[True]; DEALERS_PER_PAGE=8
+    # Output: dealer A sum=1,count=2; B sum=1,count=1; shown A then B; n=3,m=2
     g = result["groups"]
     multi = g.loc[g["multi"]]
     n, m = len(g), len(multi)
@@ -146,10 +191,15 @@ def overview_figure(result, page=1):
     dealer = dealer.sort_values(["sum", "count"], ascending=False, kind="stable")
     shown = dealer.iloc[(page - 1) * DEALERS_PER_PAGE:page * DEALERS_PER_PAGE]
     # Composition among multi-spread events, not the old within-category rates.
+    # CORE LOGIC: STEP 2 — Use all multi-spread events as quantity-composition denominator
+    # Input: multi events: one all_zero=True; one has_zero=True/all_zero=False; one has_unknown=True
+    # Output: qcounts All zero=1, Zero + positive=1, Missing / other=1; other categories=0
+    # Trick: Composition totals sum to m; these shares are not within-quantity-category multi rates.
     qlabels = ["Same positive", "Different positive", "All zero", "Zero + positive", "Missing / other"]
     qtypes = multi["qclass"].where(~multi["has_zero"], "Zero + positive")
     qtypes = qtypes.mask(multi["all_zero"], "All zero").mask(multi["has_unknown"], "Missing / other")
     qcounts = qtypes.value_counts().reindex(qlabels, fill_value=0)
+    # PLOTTING LOGIC: STEP 3 — Draw dealer rates, multi-event quantity composition and same-instant gap CDF together
     fig = Figure(figsize=(17, 7.5), facecolor="white")
     a, b, c = fig.subplots(1, 3)
     fig.subplots_adjust(left=0.14, right=0.97, top=0.62, bottom=0.25, wspace=0.62)
@@ -199,7 +249,11 @@ def overview_figure(result, page=1):
     return fig
 
 
+# SETUP LOGIC: Declare case_figure; existing arguments and docstring are preserved
 def case_figure(result, event, minutes=None, value_page=1):
+    # CORE LOGIC: STEP 1 — Select the complete known ET day and the exact candidate timestamp
+    # Input: event A/X/bid at Mar2 10:00; raw A/X/bid rows at 09:00,10:00,11:00 plus a Mar3 row
+    # Output: day contains the three Mar2 rows; selected contains only 10:00; local window narrows display if requested
     q, t = result["quotes"], event["quote_timestamp_ET"]
     mask = q["firm"].eq(event["firm"]) & q["cusip"].eq(event["cusip"]) & q["side"].eq(event["side"])
     mask &= q["quote_timestamp_ET"].dt.normalize().eq(t.normalize())
@@ -208,12 +262,17 @@ def case_figure(result, event, minutes=None, value_page=1):
     selected = day.loc[day["quote_timestamp_ET"].eq(t)]
     # Separate candidate rows avoid overplotting two zero quantities at one point.
     # Row positions are labels only; neither candidate identities nor size ordering.
+    # CORE LOGIC: STEP 2 — Separate repeated candidate values without assigning persistent identities
+    # Input: selected rows [(spread=95,q=0),(spread=98,q=0),(spread=98,q=0)]
+    # Output: values has (95,0,rows=1) and (98,0,rows=2); page 1 shows both
+    # Trick: String value pairs preserve source display distinctions; row positions are display labels only.
     candidates = selected.assign(spread_text=selected["spread"].astype(str), quantity_text=selected["quantity"].astype(str))
     values = candidates.groupby(["spread_text", "quantity_text"], sort=False, dropna=False).agg(
         rows=("s", "size"), s=("s", "first"), qkind=("qkind", "first"),
     ).reset_index()
     start = (value_page - 1) * 8
     shown = values.iloc[start:start + 8]
+    # PLOTTING LOGIC: STEP 3 — Show actual full-day raw points and separate candidate values on independent subplot scales
     fig = Figure(figsize=(16, 8), facecolor="white")
     a, b = fig.subplots(1, 2, gridspec_kw={"width_ratios": [1.65, 1]})
     fig.subplots_adjust(left=0.08, right=0.94, top=0.75, bottom=0.29, wspace=0.40)
@@ -256,6 +315,10 @@ def case_figure(result, event, minutes=None, value_page=1):
     b.set_xlabel("Benchmark spread (bps) | separate event scale")
     b.set_title(f"Candidates at the selected instant only\nValues {start + 1}-{min(start + 8, len(values))} of {len(values)}", fontsize=12)
     b.grid(axis="x", alpha=0.15)
+    # CORE LOGIC: STEP 3 — Explain simultaneous quantity ambiguity without inferring a size effect
+    # Input: event all_zero=False, qclass='Different positive'; selected (q,spread)=[(2,95),(2,98),(5,100)]
+    # Output: ambiguous_size=True; meaning='Different quantities occur, but a quantity still maps to multiple spreads.'
+    # Trick: All-zero sizes cannot distinguish candidates; different sizes alone do not establish causality.
     if event["all_zero"]:
         meaning = "All quantities are zero: size information cannot distinguish these candidates."
     elif event["qclass"] == "Same positive":
@@ -266,9 +329,13 @@ def case_figure(result, event, minutes=None, value_page=1):
                    "Different positive quantities accompany the spreads; a size effect is not yet established.")
     else:
         meaning = "Zero / missing / other quantities leave quote conditions partly unknown."
+    # CORE LOGIC: STEP 4 — Avoid declaring an observed single-spread event clean
+    # Input: event multi=False, bad_spreads=0 or bad_spreads=1
+    # Output: complete case says no observed multi-spread; incomplete case says candidate ambiguity is unassessed
     if not event["multi"]:
         meaning = "No observed multi-spread here; incomplete spread values remain unassessed." if event["bad_spreads"] else "One observed spread at this timestamp; this does not validate the quote's economic meaning."
     context = ("Only one timestamp in this window: persistence cannot be assessed." if n_times <= 1 else
+               # PLOTTING LOGIC: STEP 6 — Write candidate interpretation and retained incomplete/repeated-row details on the full figure
                "Inspect whether multiple levels recur; the plot does not assign identities across timestamps.")
     fig.text(0.08, 0.135, meaning + "\n" + context, fontsize=11)
     fig.text(0.08, 0.055, f"Same-side candidates coexist; their gap is not a time-series jump or a bid/ask width. Quantity is in raw, unconfirmed units.\nSelected event: {int(event['repeats'])} extra identical rows; {int(event['bad_spreads'])} nonfinite spreads. Row labels are display positions only.", fontsize=10, color="#6A4F39")
@@ -287,6 +354,7 @@ def case_figure(result, event, minutes=None, value_page=1):
 
 # %% 3. Dropdown controls and PNG export
 # Detach old observers when rerunning this cell in the same kernel.
+# UI LOGIC: STEP 7 — Detach old callbacks and construct scope/case navigation without freezing probes automatically
 if "step2_controls" in globals():
     for control in step2_controls:
         control.unobserve(refresh_step2, names="value")
@@ -330,7 +398,9 @@ case_controls = widgets.VBox([case_type, widgets.HBox([dealer_box, bond_box, sid
                               widgets.HBox([date_box, values_page]), widgets.HBox([window_mode, window_box]), widgets.HBox([event_page, event_box])])
 step2_result, current_figure, busy = None, None, False
 
+# SETUP LOGIC: Declare refresh_step2; existing arguments and docstring are preserved
 def refresh_step2(change=None):
+    # UI LOGIC: STEP 1 — Update controls, status and the displayed result without redefining research rules
     global step2_result, current_figure, busy
     if busy:
         return
@@ -416,7 +486,9 @@ def refresh_step2(change=None):
     finally:
         busy = False
 
+# SETUP LOGIC: Declare save_step2; existing arguments and docstring are preserved
 def save_step2(change=None):
+    # FILE IO LOGIC: STEP 1 — Export the complete displayed figure to the existing output folder
     folder = Path("outputs/quote_quality_step2")
     folder.mkdir(parents=True, exist_ok=True)
     name = "".join(c if c.isalnum() else "_" for c in str(step2_result["issuer"]))[:60]
@@ -425,27 +497,35 @@ def save_step2(change=None):
     current_figure.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
     save_status.value = f"Saved: {path}"
 
+# SETUP LOGIC: Declare scope_changed; existing arguments and docstring are preserved
 def scope_changed(change=None):
+    # UI LOGIC: STEP 1 — Update controls, status and the displayed result without redefining research rules
     value_box.options = scope_options(quality_population, scope_box.value)
     value_box.layout.display = "none" if scope_box.value in ["Global", "Issuer"] else ""
     issuer_box.layout.display = "" if scope_box.value == "Issuer" else "none"
     if scope_box.value == "Issuer" and issuer_box.value in value_box.options:
         value_box.value = issuer_box.value
 
+# SETUP LOGIC: Declare apply_scope; existing arguments and docstring are preserved
 def apply_scope(change=None):
+    # UI LOGIC: STEP 1 — Update controls, status and the displayed result without redefining research rules
     global applied_scope, applied_value, step2_result
     applied_scope, applied_value = scope_box.value, value_box.value
     step2_result = None
     refresh_step2({"owner": apply_button})
 
+# SETUP LOGIC: Declare change_issuer; existing arguments and docstring are preserved
 def change_issuer(change=None):
+    # UI LOGIC: STEP 1 — Update controls, status and the displayed result without redefining research rules
     if busy:
         return
     scope_box.value = "Issuer"
     value_box.value = issuer_box.value
     apply_scope()
 
+# SETUP LOGIC: Declare freeze_cases; existing arguments and docstring are preserved
 def freeze_cases(change=None):
+    # UI LOGIC: STEP 1 — Update controls, status and the displayed result without redefining research rules
     global case_manifest
     freeze_button.disabled = True
     case_manifest_status.value = "Measuring rule center/coverage changes at first/middle/last local queries per observed bond/side/day..."
@@ -464,7 +544,9 @@ def freeze_cases(change=None):
     finally:
         freeze_button.disabled = False
 
+# SETUP LOGIC: Declare apply_fixed_case; existing arguments and docstring are preserved
 def apply_fixed_case(change=None):
+    # UI LOGIC: STEP 1 — Update controls, status and the displayed result without redefining research rules
     global applied_scope, applied_value, step2_result, busy
     if case_manifest is None or fixed_case_box.value is None:
         return
@@ -487,6 +569,7 @@ def apply_fixed_case(change=None):
     case_manifest_status.value = f"Case {row.case_number}: {row.selection_reason}; events={int(row.events):,}. " +         "Cleaning/feature decision: preserve candidate/quantity ambiguity and check the measured center/coverage cost."
 
 # All-events navigation exposes sparse and one-sided controls selected by the manifest.
+# UI LOGIC: STEP 8 — Wire one callback set, show the dashboard and render initial Global overview
 case_type.options = ["All events"] + list(case_type.options)
 step2_controls = [view_box, page_box, case_type, dealer_box, bond_box, side_box, date_box, event_page, event_box, window_mode, window_box, values_page]
 for box in step2_controls:

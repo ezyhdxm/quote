@@ -1,3 +1,4 @@
+# TEST SETUP LOGIC: 合成fixtures与断言；测试通过不代表真实预测增益。
 """Integration checks for exact-time groups, denominators and case controls."""
 import contextlib
 import io
@@ -16,10 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "quote_quality_step2.py"
 
 
+# TEST FIXTURE LOGIC: fixture；仅用于复现输入或核对行为。
 def fixture():
     rows = []
     base = pd.Timestamp("2026-03-02T15:00:00Z")
 
+    # TEST FIXTURE LOGIC: group；仅用于复现输入或核对行为。
     def group(i, spreads, sizes, firm="A", cusip="BOND_A"):
         for spread, size in zip(spreads, sizes):
             rows.append((cusip, firm, "bid", base + pd.Timedelta(minutes=i), spread, size, "original"))
@@ -49,11 +52,13 @@ def fixture():
     return quotes, trades
 
 
+# TEST FIXTURE LOGIC: load_dashboard；仅用于复现输入或核对行为。
 def load_dashboard(quotes=None, trades=None, issuer="Alpha"):
     default_quotes, default_trades = fixture()
     quotes = default_quotes if quotes is None else quotes
     trades = default_trades if trades is None else trades
 
+    # TEST FIXTURE LOGIC: read；仅用于复现输入或核对行为。
     def read(path, *args, **kwargs):
         return (trades if Path(path).name == "data_ig.parquet" else quotes).copy(deep=True)
 
@@ -69,10 +74,13 @@ def load_dashboard(quotes=None, trades=None, issuer="Alpha"):
     return state, show
 
 
+# TEST LOGIC: MultiSpreadChecks；仅用于复现输入或核对行为。
 class MultiSpreadChecks(unittest.TestCase):
+    # TEST FIXTURE LOGIC: tearDown；仅用于复现输入或核对行为。
     def tearDown(self):
         plt.close("all")
 
+    # TEST LOGIC: test_exact_timestamp_and_group_denominators_without_cleaning；仅用于复现输入或核对行为。
     def test_exact_timestamp_and_group_denominators_without_cleaning(self):
         state, _ = load_dashboard()
         result = state["step2_result"]
@@ -89,6 +97,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(str(g["quote_timestamp_ET"].dt.tz), "America/New_York")
         self.assertEqual(g["quote_timestamp_ET"].iloc[0].hour, 10)
 
+    # TEST LOGIC: test_exact_duplicates_use_all_original_columns_and_keep_raw_rows；仅用于复现输入或核对行为。
     def test_exact_duplicates_use_all_original_columns_and_keep_raw_rows(self):
         state, _ = load_dashboard()
         r = state["step2_result"]
@@ -100,6 +109,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(a.loc[8, "repeats"], 1)
         self.assertEqual(a.loc[8, "n_spreads"], 1)
 
+    # TEST LOGIC: test_quantity_priority_zero_semantics_and_incomplete_groups；仅用于复现输入或核对行为。
     def test_quantity_priority_zero_semantics_and_incomplete_groups(self):
         state, _ = load_dashboard()
         a = state["step2_result"]["groups"].loc[lambda d: d["firm"].eq("A")].reset_index(drop=True)
@@ -118,6 +128,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertIn("2 keyed groups", text)
         self.assertIn("unassessed", text)
 
+    # TEST LOGIC: test_widget_case_filters_controls_and_unkeyed_issuer_clear_old_chart；仅用于复现输入或核对行为。
     def test_widget_case_filters_controls_and_unkeyed_issuer_clear_old_chart(self):
         state, show = load_dashboard()
         state["view_box"].value = "Case"
@@ -140,6 +151,7 @@ class MultiSpreadChecks(unittest.TestCase):
         for call in show.call_args_list:
             self.assertFalse(any(isinstance(a, pd.DataFrame) for a in call.args))
 
+    # TEST LOGIC: test_case_preserves_all_candidates_and_paginated_exact_values；仅用于复现输入或核对行为。
     def test_case_preserves_all_candidates_and_paginated_exact_values(self):
         quotes, trades = fixture()
         extra = pd.concat([quotes.iloc[[0]]] * 17, ignore_index=True)
@@ -154,6 +166,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertIn("spread=16", texts)
         self.assertEqual(len(state["step2_result"]["raw"]), 17)
 
+    # TEST LOGIC: test_overview_paging_leaves_issuer_statistics_and_range_distribution_intact；仅用于复现输入或核对行为。
     def test_overview_paging_leaves_issuer_statistics_and_range_distribution_intact(self):
         quotes, trades = fixture()
         extra = pd.concat([quotes.iloc[[0]]] * 12, ignore_index=True)
@@ -166,6 +179,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(len(second.axes[0].patches), 4)
         self.assertEqual(len(state["step2_result"]["groups"]), 12)
 
+    # TEST LOGIC: test_event_pages_expose_all_controls_and_issuer_switch_resets；仅用于复现输入或核对行为。
     def test_event_pages_expose_all_controls_and_issuer_switch_resets(self):
         state, _ = load_dashboard()
         state["view_box"].value = "Case"
@@ -183,6 +197,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(state["event_page"].value, 1)
         self.assertEqual(state["dealer_box"].value, "Z")
 
+    # TEST LOGIC: test_same_price_different_quantities_and_incomplete_multi_are_distinct；仅用于复现输入或核对行为。
     def test_same_price_different_quantities_and_incomplete_multi_are_distinct(self):
         quotes, trades = fixture()
         q = pd.concat([quotes.iloc[[0]]] * 8, ignore_index=True)
@@ -203,6 +218,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(incomplete["n_spreads"], 2)
         self.assertEqual(incomplete["bad_spreads"], 1)
 
+    # TEST LOGIC: test_quantity_composition_counts_events_and_splits_zero_cases；仅用于复现输入或核对行为。
     def test_quantity_composition_counts_events_and_splits_zero_cases(self):
         state, _ = load_dashboard()
         panel = state["current_figure"].axes[1]
@@ -216,6 +232,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertIn("Zero + positive", labels)
         self.assertIn("2/6", labels)
 
+    # TEST LOGIC: test_full_day_context_and_separate_zero_candidates；仅用于复现输入或核对行为。
     def test_full_day_context_and_separate_zero_candidates(self):
         quotes, trades = fixture()
         raw = pd.concat([quotes.iloc[[0]]] * 4, ignore_index=True)
@@ -235,6 +252,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertIn("2 raw rows at 1 timestamps", state["current_figure"].axes[0].get_title())
         self.assertIn("Only one timestamp", " ".join(t.get_text() for t in state["current_figure"].texts))
 
+    # TEST LOGIC: test_refresh_has_one_image_and_rerun_detaches_previous_callbacks；仅用于复现输入或核对行为。
     def test_refresh_has_one_image_and_rerun_detaches_previous_callbacks(self):
         state, show = load_dashboard()
         old_control = state["view_box"]
@@ -254,6 +272,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(show.call_count, 2)
         self.assertTrue(all(isinstance(call.args[0], state["widgets"].VBox) for call in show.call_args_list))
 
+    # TEST LOGIC: test_representative_issuers_lead_large_dropdown_without_dropping_small_ones；仅用于复现输入或核对行为。
     def test_representative_issuers_lead_large_dropdown_without_dropping_small_ones(self):
         rows, securities = [], []
         base = pd.Timestamp("2026-03-02T15:00:00Z")
@@ -297,6 +316,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(list(options), repeated_options)
         pd.testing.assert_frame_equal(summary, repeated_summary)
 
+    # TEST LOGIC: test_ranking_fallback_is_labelled_and_matches_selected_issuer_statistics；仅用于复现输入或核对行为。
     def test_ranking_fallback_is_labelled_and_matches_selected_issuer_statistics(self):
         state, _ = load_dashboard()
         self.assertEqual(state["issuer_box"].options[0], ("Alpha", "Alpha"))
