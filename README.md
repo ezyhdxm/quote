@@ -1,3 +1,30 @@
+# Saved validation and SECTOR review
+
+After Step5 finishes, use **Export features** once. Open
+`quote_quality_validation_review.ipynb` and run its three small cells. It reads
+existing `model_features.parquet`, `validation_predictions.parquet` and
+`experiment.json`, or uses the current kernel's completed frame and predictions.
+It never trains or opens test predictions. Do not restart the original kernel or
+rerun its controls cell just to view results.
+
+For an existing live Step5 session, one new cell is enough:
+
+```python
+from quote_quality_saved import show_validation_sectors
+sector_review = show_validation_sectors(step5_frame, step5_predictions, selected="Quote levels")
+```
+
+Repeat with `selected="Reliability"` and then a rule choice such as `"Age decay"`.
+Each complete 2×2 PNG has sector MAE deltas, target-row quote/pair coverage,
+sector × ET-date deltas with sample counts, and sector tail-error deltas.
+SECTOR uses the target trade row, not a CUSIP-wide mapping, and does not change
+the 14 BASE_FEATURES. Missing sectors stay Unknown; unmatched or unequal model
+cohorts fail before drawing. Date-equal and leave-one-date diagnostics are
+sensitivity checks, not confidence intervals. Keep the locked test unopened
+until the validation choice is final.
+
+---
+
 # Data quality research — steps 4 and 5
 
 Open `quote_quality_step4.ipynb` for same-dealer bid/ask pairing and
