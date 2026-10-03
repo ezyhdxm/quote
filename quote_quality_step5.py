@@ -179,7 +179,7 @@ step5_selected=widgets.Dropdown(options=['Base'],description='Choice:',disabled=
 step5_export=widgets.Button(description='Export features')
 step5_save=widgets.Button(description='Save all PNG',icon='download',disabled=True)
 step5_status=widgets.HTML();step5_image=widgets.Image(format='png',layout=widgets.Layout(width='100%',max_width='1600px'))
-step5_progress=widgets.IntProgress(description='Bonds:',min=0,max=1,value=0,layout=widgets.Layout(width='650px'))
+step5_progress=widgets.IntProgress(description='Bonds:',min=0,max=1,value=0,style={'description_width':'initial'},layout=widgets.Layout(width='650px'))
 step5_rounds=widgets.IntProgress(description='Iterations:',min=0,max=1,value=0,layout=widgets.Layout(width='650px',display='none'))
 step5_detail=widgets.HTML();step5_elapsed=widgets.HTML()
 step5_clock_stop=Event()
@@ -196,7 +196,8 @@ def report_step5(stage,completed=None,total=None,detail=''):
     if stage!='models' and not final and not transition and now-step5_progress_state['last_update']<.2:return
     step5_progress_state['last_update']=now
     if stage in ['features','models']:
-        step5_progress.description='Bonds:' if stage=='features' else 'Models:'
+        unit='Bonds' if stage=='features' else 'Models'
+        step5_progress.description=f'{unit}: {int(completed or 0):,}/{int(total or 0):,}'
         step5_progress.max=max(1,int(total or 0));step5_progress.value=int(completed or 0)
         step5_rounds.layout.display='none'
         step5_progress_state['phase']=stage
