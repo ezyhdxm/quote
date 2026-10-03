@@ -104,6 +104,34 @@ class QuantityStep1Checks(unittest.TestCase):
     def tearDown(self):
         plt.close("all")
 
+    def test_step1_never_builds_full_quote_history(self):
+        with patch("quote_quality_core.event_history", side_effect=AssertionError("quantity needs no history")), \
+                patch("quote_quality_core.prepare_quote_events", side_effect=AssertionError("quantity needs no event cache")):
+            state, _ = load_dashboard(issuer=None)
+        self.assertEqual(state["quantity_result"]["scope"], "Global")
+        self.assertIn("Ready", state["quantity_status"].value)
+
+    def test_cells_two_and_three_reuse_loaded_frames_after_old_load_interrupt(self):
+        quotes, trades = fixture()
+        quotes["quote_timestamp_ET"] = pd.to_datetime(quotes.quote_timestamp_UTC, utc=True).dt.tz_convert("America/New_York")
+        namespace = {"data_ig": trades, "bcq_df": quotes}
+        # Reproduce the imports available after the old loading cell interrupted.
+        old_imports = """from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+"""
+        sections = SCRIPT.read_text().split("# %% ")
+        resumed = "\n".join(section.partition("\n")[2] for section in sections if section.startswith(("2.", "3.")))
+        with patch("IPython.display.display"), patch("IPython.display.clear_output"), \
+                patch("pandas.read_parquet", side_effect=AssertionError("loaded frames must be reused")):
+            exec(old_imports + resumed, namespace)
+        self.assertIs(namespace["data_ig"], trades)
+        self.assertEqual(namespace["quantity_result"]["scope"], "Global")
+
     def test_raw_quantity_categories_are_exhaustive_and_do_not_infer_units(self):
         state, _ = load_dashboard()
         data = state["quantity_data"]

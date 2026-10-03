@@ -42,17 +42,25 @@ def prepare_quote_events(quotes, progress=None, cache_dir='outputs/quote_quality
         return core.prepare_quote_events(quotes, progress)
     started = perf_counter()
     if progress is not None:
-        progress('events', None, None, 'Checking shared narrow-event cache')
+        progress('events', None, None, f'Hashing {len(quotes):,} source rows and full-row repeat flags for cache identity')
     key = _source_key(quotes)
+    identity_s = perf_counter() - started
     folder = Path(cache_dir)
     data_path, manifest_path = folder / (key + '.parquet'), folder / (key + '.json')
     status = 'miss'
     if data_path.is_file() and manifest_path.is_file():
         try:
+            read_started = perf_counter()
+            if progress is not None:
+                progress('events', None, None, 'Checking cached file content and reading event Parquet')
             manifest = json.loads(manifest_path.read_text())
             if manifest['key'] != key or manifest['schema'] != SCHEMA_VERSION or manifest['sha256'] != _file_hash(data_path):
                 raise ValueError('Cache identity or file content changed')
             events = pd.read_parquet(data_path)
+            read_s = perf_counter() - read_started
+            decode_started = perf_counter()
+            if progress is not None:
+                progress('events', None, None, f'Decoding exact candidate sets for {len(events):,} cached events')
             for col in ['spread_set', 'quantity_set']:
                 events[col] = events[col].map(lambda value: tuple(json.loads(value)))
             events['pair_set'] = events.pair_set.map(lambda value: frozenset(tuple(pair) for pair in json.loads(value)))
@@ -61,15 +69,24 @@ def prepare_quote_events(quotes, progress=None, cache_dir='outputs/quote_quality
             if progress is not None:
                 progress('events', len(events), len(events), 'Reused checked narrow-event cache')
             return dict(events=events, unkeyed=manifest['unkeyed'], cache_key=key, cache_status='hit',
-                        timings={'cache_load_s': perf_counter() - started})
+                        timings={'cache_identity_s': identity_s, 'cache_read_s': read_s,
+                                 'cache_decode_s': perf_counter() - decode_started,
+                                 'cache_load_s': perf_counter() - started})
         except (OSError, ValueError, KeyError, TypeError):
             status = 'invalid; rebuilt'
     result = core.prepare_quote_events(quotes, progress)
     folder.mkdir(parents=True, exist_ok=True)
+    encode_started = perf_counter()
+    if progress is not None:
+        progress('events', None, None, f'Encoding exact candidate sets for {len(result["events"]):,} events')
     export = result['events'].copy()
     for col in ['spread_set', 'quantity_set']:
         export[col] = export[col].map(lambda values: json.dumps(list(values), separators=(',', ':')))
     export['pair_set'] = export.pair_set.map(lambda values: json.dumps(sorted(list(values), key=repr), separators=(',', ':')))
+    encode_s = perf_counter() - encode_started
+    write_started = perf_counter()
+    if progress is not None:
+        progress('events', None, None, 'Writing event Parquet and verifying its content')
     with tempfile.NamedTemporaryFile(dir=folder, suffix='.parquet', delete=False) as temporary:
         temporary_path = Path(temporary.name)
     try:
@@ -85,7 +102,11 @@ def prepare_quote_events(quotes, progress=None, cache_dir='outputs/quote_quality
     finally:
         temporary_path.unlink(missing_ok=True)
     result.update(cache_key=key, cache_status=status)
+    result['timings'].update(cache_identity_s=identity_s, cache_encode_s=encode_s,
+                             cache_write_s=perf_counter() - write_started)
     result['timings']['cache_total_s'] = perf_counter() - started
+    if progress is not None:
+        progress('events', len(export), len(export), 'Checked event cache ready')
     return result
 
 

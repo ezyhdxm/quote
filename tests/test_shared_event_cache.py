@@ -19,6 +19,23 @@ def raw():
 
 
 class SharedCacheChecks(unittest.TestCase):
+    def test_cache_progress_identifies_identity_compute_encode_write_and_decode(self):
+        messages = []
+        def progress(stage, done, total, detail):
+            messages.append(detail)
+        with tempfile.TemporaryDirectory() as folder:
+            first = cache.prepare_quote_events(raw(), progress=progress, cache_dir=folder)
+            self.assertTrue(any('Hashing' in m for m in messages))
+            self.assertTrue(any('Aggregating' in m for m in messages))
+            self.assertTrue(any('Encoding' in m for m in messages))
+            self.assertTrue(any('Writing' in m for m in messages))
+            self.assertGreaterEqual(first['timings']['cache_identity_s'], 0)
+            messages.clear()
+            second = cache.prepare_quote_events(raw(), progress=progress, cache_dir=folder)
+            self.assertTrue(any('Decoding' in m for m in messages))
+            self.assertFalse(any('Aggregating' in m for m in messages))
+            self.assertGreaterEqual(second['timings']['cache_decode_s'], 0)
+
     def test_roundtrip_reuses_and_keeps_exact_nanosecond_sets(self):
         q = raw()
         with tempfile.TemporaryDirectory() as folder:

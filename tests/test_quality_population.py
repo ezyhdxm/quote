@@ -158,14 +158,16 @@ class PopulationChecks(unittest.TestCase):
                                              (load_step2, "step2_result", "apply_scope")]:
             state, _ = load(issuer=None)
             self.assertEqual(state[result_key]["scope"], "Global")
-            events = state["quality_population"]["event_cache"]["events"]
+            events = state["quality_population"]["events"]
+            if load is load_step1:
+                self.assertIsNone(state["quality_population"]["event_cache"])
             state["scope_box"].value = "SECTOR"
             self.assertEqual(state[result_key]["scope"], "Global")
             state[apply_name]()
             self.assertEqual(state[result_key]["scope"], "SECTOR")
             state["issuer_box"].value = "Beta"
             self.assertEqual(state[result_key]["scope"], "Issuer")
-            self.assertIs(events, state["quality_population"]["event_cache"]["events"])
+            self.assertIs(events, state["quality_population"]["events"])
 
     def test_fixed_case_opens_sparse_single_side_event(self):
         state, _ = load_step2(issuer=None)

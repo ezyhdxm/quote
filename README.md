@@ -23,7 +23,10 @@ B is size/time-eligible slots with original candidates, and C is the identical
 B slots with matched positive-quantity candidates. Raw positive and negative
 gap sources are retained, including dealer, side, timestamp, spread and size.
 
-Step1–4 share checked narrow-event Parquet caches under
+Step1 uses native quantity/event aggregates and does not build quote history,
+serialize candidate sets, or touch the event cache. Load and summary phases show
+elapsed time. History-dependent refresh/change statistics are unassessed here.
+Step2–4 share checked narrow-event Parquet caches under
 `outputs/quote_quality_cache/`. Source content, full-row duplicate semantics,
 core code and cache schema identify the cache; changes or damaged files rebuild
 it. Raw values are preserved, timestamps are not rounded, and no-quote targets
@@ -382,14 +385,29 @@ Run from your existing project root containing `data/` and the local `data.py` l
 Cell 1 includes your photographed loading code and paths: read `data_ig.parquet`
 when present; otherwise call `data.load_merged_prints` with thresholds
 `15 / 0.005 / 0.2` and cache the result. Then read the Wells quotes parquet,
-restrict it to CUSIPs in the supplied three-month TRACE table, convert UTC to ET,
-and map issuer from TRACE. Unrelated model/feature imports are not required.
+and convert known timestamps from UTC to ET. It only loads data. Cell 2 restricts
+quotes to the supplied three-month traded-bond universe, maps issuer/sector, and
+computes quantity/event summaries with native aggregates. It does not reconstruct
+quote history or build/hash/serialize the shared event cache. Both cells display
+the current phase and elapsed time. Unrelated model/feature imports are not required.
 
-Select an **issuer** after loading. One screenshot-friendly figure shows:
+If the older cell 1 was interrupted inside `population_tables` after loading:
+preserve its kernel, update the code, and run the revised **cells 2 and 3 only**.
+Cell 2 explicitly reloads the population module and reuses `data_ig`/`bcq_df`.
+No Step5 frame or predictions are changed. Save local notebook edits before
+updating, and load the revised cells from the updated file.
+
+Step1 needs only the population reload included in cell 2. Before later running
+Step2–4 in an already loaded research kernel, reload `quote_quality_core`, then
+`quote_quality_cache`, then `quote_quality_population` once to use their revised
+history/cache code. This does not require restarting or running Step5 controls.
+
+Start at **Global**, then Apply a **SECTOR**, **Dealer** or **Issuer** scope.
+The issuer dropdown remains available for direct drill-down. One figure shows:
 
 - Left: positive / zero / missing / other quantity shares for each dealer,
-  using every raw row for that issuer as the dealer-specific denominator.
-- Right: the positive raw quantity distribution across **all** that issuer's
+  using every raw row in the scope as the dealer-specific denominator.
+- Right: the positive raw quantity distribution across **all** the scope's
   dealers. Small discrete distributions use exact-value bars; larger ones use
   a clearly labelled log10 histogram covering the entire positive range.
 

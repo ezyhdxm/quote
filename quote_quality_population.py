@@ -25,7 +25,8 @@ def build_bond_universe(trades):
     SECTOR is assigned only when exactly one distinct non-null label exists.
     This never chooses an arbitrary first SECTOR from conflicting records.
     """
-    t = trades.loc[trades["CUSIP"].notna()].copy()
+    metadata_columns = ["CUSIP"] + [c for c in ["ISSUER", "SECTOR"] if c in trades]
+    t = trades.loc[trades["CUSIP"].notna(), metadata_columns].copy()
     t["CUSIP"] = t["CUSIP"].astype("string").str.strip()
     t = t.loc[t["CUSIP"].ne("")]
     u = pd.DataFrame({"cusip": sorted(t["CUSIP"].unique())}).set_index("cusip")
@@ -181,6 +182,163 @@ def population_tables(trades, quotes, event_cache=None):
             "case_manifest": None, "case_candidates": None, "impact_table": None}
 
 
+def quantity_population_tables(trades, quotes, progress=None):
+    """Step 1 descriptive summaries without histories, event caches or set objects.
+
+    All group reductions use numeric columns and pandas built-ins. The only
+    event/quantity secondary groupby checks whether the same positive raw size
+    has two distinct finite spreads. Refresh/change history is not evaluated.
+    """
+    def report(done, detail):
+        if progress is not None:
+            progress("quantity_population", done, 6, detail)
+
+    report(0, f"Reading narrow metadata for {len(trades):,} traded rows")
+    u = build_bond_universe(trades)
+    raw = attach_quote_metadata(quotes, u)
+    metadata = u.set_index("cusip")
+    # The raw source stays available once; quantity and aggregation work are narrow.
+    q = quantity_rows(raw[KEYS + ["quantity", "ISSUER", "SECTOR"]])
+    q["_source_repeat"] = raw.duplicated().to_numpy()
+    for kind in KINDS:
+        q[f"raw_{kind.lower()}_rows"] = q["quantity_kind"].eq(kind)
+    q["day"] = q[KEYS[-1]].dt.normalize()
+    report(1, f"Classified quantity for {len(q):,} raw quote rows; grouping exact timestamps")
+    valid = raw[KEYS].notna().all(axis=1)
+    for key in SERIES:
+        valid &= raw[key].astype("string").str.strip().ne("").fillna(False)
+    z = raw.loc[valid, KEYS].copy()
+    z["s"] = pd.to_numeric(raw.loc[valid, "spread"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    z["positive_q"] = q.loc[valid, "quantity_numeric"].where(q.loc[valid, "quantity_kind"].eq("Positive"))
+    z["zero"] = q.loc[valid, "quantity_kind"].eq("Zero")
+    z["unknown"] = q.loc[valid, "quantity_kind"].isin(["Missing", "Other"])
+    z["bad"] = z["s"].isna()
+    z["repeat"] = q.loc[valid, "_source_repeat"]
+    z["event_id"] = z.groupby(KEYS, observed=True, sort=False).ngroup()
+    stats = z.groupby("event_id", observed=True, sort=False).agg(
+        rows=("s", "size"), repeats=("repeat", "sum"), bad=("bad", "sum"),
+        n_spreads=("s", "nunique"), lo=("s", "min"), hi=("s", "max"),
+        n_quantity=("positive_q", "nunique"), has_zero=("zero", "max"),
+        all_zero=("zero", "min"), has_unknown=("unknown", "max"))
+    same = z.loc[z["positive_q"].notna() & z["s"].notna()].groupby(
+        ["event_id", "positive_q"], observed=True, sort=False)["s"].nunique().gt(1)
+    same = same.groupby(level="event_id", sort=False).any()
+    stats["same_positive_multi"] = same.reindex(stats.index, fill_value=False)
+    g = z[["event_id"] + KEYS].drop_duplicates("event_id").set_index("event_id").join(stats).reset_index(drop=True)
+    g["candidate_count"] = g["n_spreads"]
+    g["multi"] = g["n_spreads"].ge(2)
+    g["complete"] = g["bad"].eq(0) & g["n_spreads"].gt(0)
+    g["incomplete"] = ~g["complete"]
+    g["bad_spreads"], g["gap"] = g["bad"], g["hi"] - g["lo"]
+    g["range_bps"] = g["gap"]
+    g["day"] = g[KEYS[-1]].dt.normalize()
+    for col in ["ISSUER", "SECTOR"]:
+        g[col] = g["cusip"].map(metadata[col])
+    g["qclass"] = np.select([g["has_unknown"].to_numpy(bool), g["has_zero"].to_numpy(bool), g["n_quantity"].gt(1)],
+                            [QKINDS[3], QKINDS[2], QKINDS[1]], default=QKINDS[0])
+    for state in QKINDS:
+        g["quantity_event_" + state.lower().replace(" / ", "_").replace(" ", "_")] = g["qclass"].eq(state)
+    report(2, f"Reduced {len(z):,} keyed rows to {len(g):,} events; no change history or cache job")
+    units = g.groupby(SERIES + ["day"], observed=True, sort=False).agg(
+        events=("multi", "size"), multi=("multi", "sum"), affected=("multi", "max"),
+        ISSUER=("ISSUER", "first"), SECTOR=("SECTOR", "first")).reset_index()
+    units["rate"] = units["multi"].div(units["events"])
+    timestamps = pd.to_datetime(trades["EFFECTIVE_DATETIME_TS"], errors="coerce")
+    timestamps = (timestamps.dt.tz_localize("America/New_York") if timestamps.dt.tz is None
+                  else timestamps.dt.tz_convert("America/New_York"))
+    td = pd.DataFrame({"cusip": trades["CUSIP"], "day": timestamps.dt.normalize()}).dropna().drop_duplicates()
+    td = td.loc[td["cusip"].isin(u["cusip"])]
+    for col in ["ISSUER", "SECTOR"]:
+        td[col] = td["cusip"].map(metadata[col])
+    quote_dates = quotes[KEYS[-1]].dropna().dt.normalize()
+    td["in_quote_window"] = td["day"].between(quote_dates.min(), quote_dates.max()) if len(quote_dates) else False
+    td["quote_window_known"] = bool(len(quote_dates))
+    td["outside_file_window_trade_days"] = ~td["in_quote_window"] & td["quote_window_known"]
+    td["unknown_quote_window_trade_days"] = ~td["quote_window_known"]
+    # One quote/trade-day merge. Dealer denominators are scalar universe counts,
+    # so no dealer x traded-day cartesian product is constructed.
+    quote_days = q[["firm", "cusip", "day"]].dropna(subset=["cusip", "day"]).drop_duplicates()
+    covered = quote_days.merge(td.loc[td["in_quote_window"]], on=["cusip", "day"], how="inner", validate="many_to_one")
+    covered_bonds = covered.drop_duplicates(["cusip", "day"])
+    report(3, f"Joined quote/trade coverage once for {len(td):,} traded bond-days")
+
+    def grouped(frame, col):
+        key = frame[col] if col else pd.Series("Global", index=frame.index, dtype="string")
+        return frame.groupby(key, observed=True, sort=False)
+
+    report(4, "Building vectorized Global / SECTOR / issuer / dealer summaries")
+    history_fields = ["continuous_event_transitions", "unchanged_pair_refresh_events",
+                      "changed_spread_events", "changed_condition_events"]
+    tables = {}
+    for scope, col in [("Global", None), ("SECTOR", "SECTOR"), ("Issuer", "ISSUER"), ("Dealer", "firm")]:
+        names = (["Global"] if col is None else
+                 sorted(q[col].unique()) if col == "firm" else sorted(u[col].unique()))
+        if scope == "Dealer" and not names:
+            names = ["[No observed dealer]"]
+        index = pd.Index(names, name=col)
+        raw_aggs = dict(raw_rows=("quantity_kind", "size"), quoted_bonds=("cusip", "nunique"),
+                        repeats=("_source_repeat", "sum"))
+        raw_aggs.update({f"raw_{k.lower()}_rows": (f"raw_{k.lower()}_rows", "sum") for k in KINDS})
+        summary = grouped(q, col).agg(**raw_aggs).reindex(index, fill_value=0)
+        event_aggs = dict(events=("multi", "size"), multi_events=("multi", "sum"),
+            keyed_rows=("rows", "sum"), observed_issuers=("ISSUER", "nunique"),
+            observed_dealers=("firm", "nunique"), keyed_quote_bonds=("cusip", "nunique"),
+            same_positive_multi_events=("same_positive_multi", "sum"),
+            unknown_quantity_events=("has_unknown", "sum"), zero_quantity_events=("has_zero", "sum"),
+            incomplete_events=("incomplete", "sum"))
+        event_aggs.update({"quantity_event_" + k.lower().replace(" / ", "_").replace(" ", "_"):
+                          ("quantity_event_" + k.lower().replace(" / ", "_").replace(" ", "_"), "sum") for k in QKINDS})
+        summary = summary.join(grouped(g, col).agg(**event_aggs).reindex(index, fill_value=0))
+        daily = grouped(units, col).agg(dealer_bond_side_days=("rate", "size"),
+            affected_dealer_bond_side_days=("affected", "sum"), unit_equal_multi_rate=("rate", "mean"),
+            affected_unit_rate=("affected", "mean")).reindex(index)
+        daily[["dealer_bond_side_days", "affected_dealer_bond_side_days"]] = daily[["dealer_bond_side_days", "affected_dealer_bond_side_days"]].fillna(0)
+        summary = summary.join(daily)
+        bdkeys = ([col] if col else []) + ["cusip", "day"]
+        bond_days = g.groupby(bdkeys, observed=True, sort=False)["multi"].max().reset_index()
+        summary = summary.join(grouped(bond_days, col).agg(observed_bond_days=("multi", "size"),
+            affected_bond_days=("multi", "sum")).reindex(index, fill_value=0))
+        for equal_col, output in [("ISSUER", "issuer_equal_multi_rate"), ("firm", "dealer_equal_multi_rate")]:
+            if col is None:
+                summary[output] = g.groupby(equal_col, observed=True)["multi"].mean().mean()
+            elif col == equal_col:
+                summary[output] = grouped(g, col)["multi"].mean()
+            else:
+                equal = g.groupby([col, equal_col], observed=True, sort=False)["multi"].mean()
+                summary[output] = equal.groupby(level=0, observed=True, sort=False).mean()
+        if col == "firm":
+            summary["traded_bonds"] = len(u)
+            summary["traded_issuers"] = u["ISSUER"].nunique()
+            summary["three_month_traded_bond_days"] = len(td)
+            summary["traded_bond_days"] = int(td["in_quote_window"].sum())
+            summary["outside_file_window_trade_days"] = int(td["outside_file_window_trade_days"].sum())
+            summary["unknown_quote_window_trade_days"] = int(td["unknown_quote_window_trade_days"].sum())
+            coverage = covered.groupby("firm", observed=True, sort=False).size()
+        else:
+            universe_stats = grouped(u, col).agg(traded_bonds=("cusip", "size"), traded_issuers=("ISSUER", "nunique"))
+            summary = summary.join(universe_stats.reindex(index, fill_value=0))
+            trade_stats = grouped(td, col).agg(three_month_traded_bond_days=("cusip", "size"),
+                traded_bond_days=("in_quote_window", "sum"), outside_file_window_trade_days=("outside_file_window_trade_days", "sum"),
+                unknown_quote_window_trade_days=("unknown_quote_window_trade_days", "sum"))
+            summary = summary.join(trade_stats.reindex(index, fill_value=0))
+            coverage = grouped(covered_bonds, col).size()
+        summary["quote_covered_traded_bond_days"] = coverage.reindex(index, fill_value=0)
+        summary["no_quote_bonds"] = summary["traded_bonds"] - summary["quoted_bonds"]
+        summary["no_keyed_event_bonds"] = summary["traded_bonds"] - summary["keyed_quote_bonds"]
+        summary["unkeyed_rows"] = summary["raw_rows"] - summary.pop("keyed_rows")
+        summary["bond_coverage"] = summary["quoted_bonds"].div(summary["traded_bonds"].replace(0, np.nan))
+        summary["multi_event_rate"] = summary["multi_events"].div(summary["events"].replace(0, np.nan))
+        summary["share_of_all_events"] = summary["events"] / max(len(g), 1)
+        for kind in KINDS:
+            summary[f"raw_{kind.lower()}_share"] = summary[f"raw_{kind.lower()}_rows"].div(summary["raw_rows"].replace(0, np.nan))
+        summary[history_fields] = np.nan
+        tables[scope] = summary
+    report(6, f"Ready: {len(q):,} raw rows / {len(g):,} exact events; history not evaluated")
+    return dict(universe=u, raw=raw, quantity=q, events=g, tables=tables, event_cache=None,
+                unkeyed=int((~valid).sum()), trade_days=td, case_manifest=None,
+                case_candidates=None, impact_table=None, population_kind="quantity_only")
+
+
 def scope_selection(population, scope="Global", value=None):
     q, g, u = population["quantity"], population["events"], population["universe"]
     col = {"SECTOR": "SECTOR", "Issuer": "ISSUER", "Dealer": "firm"}.get(scope)
@@ -329,6 +487,10 @@ def summary_html(result):
     """Short decision-oriented text; detailed small tables remain in memory."""
     s = result["summary"]
     rate = lambda v: f"{v:.1%}" if pd.notna(v) else "N/A"
+    history = (f"Unchanged pair refresh={int(s.unchanged_pair_refresh_events):,}, spread changes={int(s.changed_spread_events):,} "
+               f"of {int(s.continuous_event_transitions):,} continuous transitions. "
+               if pd.notna(s.continuous_event_transitions) else
+               "Refresh/change history was not evaluated in Step 1. ")
     return (
         f"<b>{result['issuer']}</b>: quotes on {int(s.quoted_bonds):,}/{int(s.traded_bonds):,} traded bonds "
         f"({rate(s.bond_coverage)}); no quote={int(s.no_quote_bonds):,}; keyed-event coverage={int(s.keyed_quote_bonds):,}/{int(s.traded_bonds):,}. "
@@ -340,8 +502,7 @@ def summary_html(result):
         f"unit equal={rate(s.unit_equal_multi_rate)}. "
         f"Same positive quantity still multi={int(s.same_positive_multi_events):,}/{int(s.events):,}; "
         f"affected bond-days={int(s.affected_bond_days):,}/{int(s.observed_bond_days):,}. "
-        f"Unchanged pair refresh={int(s.unchanged_pair_refresh_events):,}, spread changes={int(s.changed_spread_events):,} "
-        f"of {int(s.continuous_event_transitions):,} continuous transitions. "
+        + history +
         "<br>Decision: preserve unknown/zero quantity and multi-price candidates; use coverage and ambiguity "
         "features before any size rule. Equal rates describe quote-observed groups; no-quote bonds stay in universe coverage. "
         "Dealer coverage uses the full traded universe. These counts do not establish prediction gain.")

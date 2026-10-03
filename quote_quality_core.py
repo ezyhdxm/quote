@@ -85,17 +85,26 @@ def event_history(raw, progress=None, keep_raw=True):
     g["last_change"] = g[KEYS[-1]].where(g["spread_changed"]).groupby(segment).ffill()
     g["change_age_min"] = (g[KEYS[-1]] - g["last_change"]).dt.total_seconds() / 60
     g["change_age_unknown"] = g["last_change"].isna()
-    g["changes_30m"] = 0
-    segments = g.groupby(segment).groups
+    # Rows are already sorted by series and time, so each history segment is a
+    # contiguous slice. Read arrays once and write once instead of constructing
+    # pandas indexers/Series for every (often singleton) segment.
+    event_times = g[KEYS[-1]].array.as_unit("ns").asi8
+    changed = g["spread_changed"].to_numpy(dtype=np.int64)
+    starts = np.flatnonzero(g["history_break"].to_numpy())
+    stops = np.r_[starts[1:], len(g)]
+    changes_30m = np.zeros(len(g), dtype=np.int64)
     if progress is not None:
-        progress('events', 0, len(segments), 'Counting changes within history segments')
-    for completed, (_, idx) in enumerate(segments.items(), 1):
-        times = g.loc[idx, KEYS[-1]].array.as_unit("ns").asi8
-        counts = np.r_[0, g.loc[idx, "spread_changed"].to_numpy().cumsum()]
-        left = np.searchsorted(times, times - LOOKBACK_MIN * 60 * 10**9, side="right")
-        g.loc[idx, "changes_30m"] = counts[1:] - counts[left]
-        if progress is not None and (completed % max(1, (len(segments) + 99) // 100) == 0 or completed == len(segments)):
-            progress('events', completed, len(segments), f'History segments {completed:,}/{len(segments):,}')
+        progress('events', 0, len(starts), 'Counting changes within history segments')
+    for completed, (start, stop) in enumerate(zip(starts, stops), 1):
+        # A singleton starts with history_break=True, hence spread_changed=False.
+        if stop-start > 1:
+            times = event_times[start:stop]
+            counts = np.r_[0, changed[start:stop].cumsum()]
+            left = np.searchsorted(times, times - LOOKBACK_MIN * 60 * 10**9, side="right")
+            changes_30m[start:stop] = counts[1:] - counts[left]
+        if progress is not None and (completed % max(1, (len(starts) + 99) // 100) == 0 or completed == len(starts)):
+            progress('events', completed, len(starts), f'History segments {completed:,}/{len(starts):,}')
+    g["changes_30m"] = changes_30m
     result = {"events": g, "unkeyed": int((~valid).sum()),
               "timings": {'normalize_s': normalized-started,
                           'aggregate_s': aggregated-normalized,

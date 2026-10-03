@@ -7,12 +7,21 @@
 
 # %% 1. Load data — paths and cache logic from your notebook
 from pathlib import Path
+from time import perf_counter
+from html import escape
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 import ipywidgets as widgets
 from IPython.display import display, clear_output
+
+load_status = widgets.HTML()
+display(load_status)
+load_started = perf_counter()
+
+def load_message(message):
+    load_status.value = f"<b>Step 1 load:</b> {escape(message)} | {perf_counter() - load_started:.1f}s elapsed"
 
 PIPELINE_CSV = Path("data/pipeline/data_pipeline.csv_20260506")
 BENCHMARK_CSV = Path("data/pipeline/DailyCloseUSTBenchmarks.csv_20260506")
@@ -26,8 +35,10 @@ def to_ny_datetime(series):
     return values.dt.tz_convert("America/New_York")
 
 if DATA_IG_CACHE.exists():
+    load_message("Reading the existing three-month TRACE cache")
     data_ig = pd.read_parquet(DATA_IG_CACHE)
 else:
+    load_message("Building the three-month TRACE cache with the existing loader")
     from data import load_merged_prints
     data_ig = load_merged_prints(
         pipeline_csv=PIPELINE_CSV, benchmark_csv=BENCHMARK_CSV,
@@ -37,13 +48,13 @@ else:
     DATA_IG_CACHE.parent.mkdir(parents=True, exist_ok=True)
     data_ig.to_parquet(DATA_IG_CACHE, index=False)
 
+load_message("Reading raw BondCliQ quotes")
 bcq_df = pd.read_parquet(RAW_QUOTES_FILE)
+load_message("Converting known timestamps to ET")
 bcq_df["quote_timestamp_ET"] = pd.to_datetime(
     bcq_df["quote_timestamp_UTC"], utc=True,
 ).dt.tz_convert("America/New_York")
-from quote_quality_population import (population_tables, scope_selection, scope_options, summary_html)
-quality_population = population_tables(data_ig, bcq_df)
-bcq_df = quality_population["raw"]
+load_message(f"Ready: {len(data_ig):,} trade rows; {len(bcq_df):,} source quote rows. Run cell 2 for quantity summaries")
 
 # %% [markdown]
 # ## Read the two panels
@@ -54,6 +65,26 @@ bcq_df = quality_population["raw"]
 # infinities and unparseable non-null values (including blank strings) are other.
 
 # %% 2. Classify quantity and define one figure
+# Updating after interrupting the old cell 1: run cells 2 and 3 only. The loaded
+# data_ig/bcq_df remain available; this reload does not touch Step5 predictions.
+import importlib
+from time import perf_counter
+from html import escape
+import quote_quality_population as population
+importlib.reload(population)
+from quote_quality_population import (quantity_population_tables, scope_selection, scope_options, summary_html)
+
+quantity_status = widgets.HTML()
+display(quantity_status)
+quantity_started = perf_counter()
+
+def quantity_progress(stage, done, total, detail):
+    count = f" | {done:,}/{total:,}" if done is not None and total is not None else ""
+    quantity_status.value = f"<b>Step 1 quantity:</b> {escape(detail)}{count} | {perf_counter() - quantity_started:.1f}s elapsed"
+
+quality_population = quantity_population_tables(data_ig, bcq_df, progress=quantity_progress)
+bcq_df = quality_population["raw"]
+quantity_progress("ready", len(bcq_df), len(bcq_df), "Ready; full quote history was not needed for quantity summaries")
 KINDS = ["Positive", "Zero", "Missing", "Other"]
 COLORS = ["#287D8E", "#E5A43C", "#A5ADB8", "#BD5367"]
 DEALERS_PER_PAGE = 8
