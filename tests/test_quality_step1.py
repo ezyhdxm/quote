@@ -13,6 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from quote_quality_core import prepare_quote_events
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,7 +57,7 @@ def fixture():
     return quotes, trades
 
 
-def load_dashboard(quotes=None, trades=None, cached=True):
+def load_dashboard(quotes=None, trades=None, cached=True, issuer="Alpha"):
     """Execute all three cells with mock data reads and real widget callbacks."""
     default_quotes, default_trades = fixture()
     quotes = default_quotes if quotes is None else quotes
@@ -84,11 +85,15 @@ def load_dashboard(quotes=None, trades=None, cached=True):
             patch.object(Path, "exists", exists), \
             patch.object(Path, "mkdir") as mkdir, \
             patch("pandas.read_parquet", side_effect=read_parquet), \
+            patch("quote_quality_cache.prepare_quote_events", side_effect=prepare_quote_events), \
             patch.object(pd.DataFrame, "to_parquet") as write_cache, \
             patch.dict(sys.modules, {"data": data_module}), \
             patch("IPython.display.display") as display, \
             patch("IPython.display.clear_output"):
         exec(compile(source, str(SCRIPT), "exec"), namespace)
+        if issuer is not None and issuer in namespace["issuer_box"].options:
+            namespace["issuer_box"].value = issuer
+            namespace["change_issuer"]()
     return namespace, {
         "loader": loader, "read_paths": read_paths, "mkdir": mkdir,
         "write_cache": write_cache, "display": display,
@@ -163,7 +168,7 @@ class QuantityStep1Checks(unittest.TestCase):
         self.assertEqual(beta["page"], 1)
         self.assertEqual(tuple(state["page_box"].options), (1,))
         self.assertTrue(beta["positive_values"].empty)
-        self.assertIn("No positive quantity in this issuer",
+        self.assertIn("No positive quantity in this scope",
                       [text.get_text() for text in beta["figure"].axes[1].texts])
         for call in calls["display"].call_args_list:
             self.assertFalse(any(isinstance(arg, pd.DataFrame) for arg in call.args))

@@ -4,7 +4,7 @@
 # Case shows **which spreads and quantities coexist at one timestamp**.
 # An event = dealer × bond × side × exact timestamp. Two bids at the same time
 # are two candidates, not a time-series jump or a bid/ask crossing.
-# The front of the issuer dropdown contains deliberately selected research cases.
+# Start with Global; scope changes apply once. Freeze 18 cases once for stable navigation.
 
 # %% 1. Load data — same paths and cache logic as step 1
 from pathlib import Path
@@ -41,13 +41,13 @@ else:
     data_ig.to_parquet(DATA_IG_CACHE, index=False)
 
 bcq_df = pd.read_parquet(RAW_QUOTES_FILE)
-bcq_df = bcq_df.loc[bcq_df["cusip"].isin(data_ig["CUSIP"])].copy()
 bcq_df["quote_timestamp_ET"] = pd.to_datetime(
     bcq_df["quote_timestamp_UTC"], utc=True, errors="coerce", format="mixed",
 ).dt.tz_convert("America/New_York")
-cusip_issuer = (data_ig[["ISSUER", "CUSIP"]].dropna()
-                .drop_duplicates("CUSIP").set_index("CUSIP")["ISSUER"])
-bcq_df["ISSUER"] = bcq_df["cusip"].map(cusip_issuer)
+from quote_quality_population import (population_tables, scope_selection, scope_options, summary_html,
+                                      fixed_case_manifest)
+quality_population = population_tables(data_ig, bcq_df)
+bcq_df = quality_population["raw"]
 
 # %% [markdown]
 # ## Read the figures
@@ -66,11 +66,6 @@ KEYS = ["firm", "cusip", "side", "quote_timestamp_ET"]
 QKINDS = ["Same positive", "Different positive", "Contains zero", "Missing / other"]
 QCOLORS = ["#287D8E", "#7656A8", "#D98B20", "#A25367"]
 DEALERS_PER_PAGE = 8
-REP_MIN_GROUPS = 100
-REP_MIN_DAYS = 2
-REP_MIN_MULTI = 5
-REP_PER_THEME = 2
-REP_MAX_CONTROL_RATE = 0.01
 issuer_labels = bcq_df["ISSUER"].astype("string").fillna("[Missing issuer]")
 
 def group_quotes(raw, keys=KEYS, count_repeats=True):
@@ -112,62 +107,36 @@ def group_quotes(raw, keys=KEYS, count_repeats=True):
             "unkeyed_rows": int((~valid_key).sum()), "repeated_rows": int(q["duplicate"].sum()),
             "bad_spread_rows": int(q["bad_spread"].sum())}
 
+def analyze_scope(scope="Global", value=None):
+    selection = scope_selection(quality_population, scope, value)
+    classified, groups = selection["raw"], selection["groups"]
+    raw = quality_population["raw"].loc[classified.index]
+    q = raw[KEYS + ["spread", "quantity"]].copy()
+    q["s"] = pd.to_numeric(q["spread"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    q["q"] = pd.to_numeric(q["quantity"], errors="coerce")
+    q["qkind"] = classified["quantity_kind"]
+    valid = q[KEYS].notna().all(axis=1)
+    for key in KEYS[:-1]:
+        valid &= q[key].astype("string").str.strip().ne("").fillna(False)
+    summary = selection["summary"]
+    return dict(selection, raw=raw, quotes=q.loc[valid], unkeyed_rows=int((~valid).sum()),
+                repeated_rows=int(raw.duplicated().sum()),
+                bad_spread_rows=int(q["s"].isna().sum()),
+                day_balanced_rate=summary.unit_equal_multi_rate,
+                affected_day_rate=summary.affected_unit_rate, day_count=int(summary.dealer_bond_side_days))
+
 def analyze_issuer(issuer):
-    raw = bcq_df.loc[issuer_labels.eq(issuer)].copy()
-    result = group_quotes(raw)
-    groups = result["groups"]
-    daily = groups.groupby(KEYS[:3] + ["day"], observed=True)["multi"].agg(["mean", "max"])
-    result.update(issuer=issuer, raw=raw, day_balanced_rate=daily["mean"].mean(),
-                  affected_day_rate=daily["max"].mean(), day_count=len(daily))
-    return result
+    return analyze_scope("Issuer", issuer)
 
 def representative_issuers():
-    # One vectorized pass, not 1,700 full dashboard runs. Discard global quote
-    # details after constructing the small issuer summary; keep every issuer.
-    narrow = bcq_df[KEYS + ["spread", "quantity"]].assign(issuer=issuer_labels.to_numpy())
-    g = group_quotes(narrow, ["issuer"] + KEYS, count_repeats=False)["groups"]
-    g["incomplete"] = g["bad_spreads"].gt(0)
-    for category, column in zip(QKINDS, ["same_multi", "different_multi", "zero_multi", "unknown_multi"]):
-        g[column] = g["multi"] & g["qclass"].eq(category)
-    summary = g.groupby("issuer", observed=True).agg(
-        groups=("multi", "size"), multi=("multi", "sum"), dealers=("firm", "nunique"),
-        days=("day", "nunique"), bonds=("cusip", "nunique"), incomplete=("incomplete", "sum"),
-        same_multi=("same_multi", "sum"), different_multi=("different_multi", "sum"),
-        zero_multi=("zero_multi", "sum"), unknown_multi=("unknown_multi", "sum"),
-    ).reindex(sorted(issuer_labels.unique()), fill_value=0)
-    daily = g.groupby(["issuer"] + KEYS[:3] + ["day"], observed=True)["multi"].agg(["mean", "max"])
-    summary["balanced_rate"] = daily["mean"].groupby(level="issuer").mean()
-    summary["affected_days"] = daily["max"].groupby(level="issuer").mean()
-    summary["range_p90"] = g.loc[g["multi"]].groupby("issuer")["range_bps"].quantile(0.9)
-    supported = (summary["groups"].ge(REP_MIN_GROUPS) & summary["days"].ge(REP_MIN_DAYS)
-                 & summary["dealers"].ge(2))
-    fallback = not supported.any()
-    pool = summary.loc[supported if not fallback else summary["groups"].gt(0)]
-    min_multi = 1 if fallback else REP_MIN_MULTI
-    multi_pool = pool.loc[pool["multi"].ge(min_multi)]
-    themes = [
-        ("Broad multi", multi_pool, "affected_days", False),
-        ("Wide multi", multi_pool, "range_p90", False),
-    ]
-    for tag, column in [("Different quantity", "different_multi"), ("Zero quantity", "zero_multi"),
-                        ("Same quantity", "same_multi"), ("Unknown quantity", "unknown_multi")]:
-        candidates = multi_pool.loc[multi_pool[column].ge(min_multi)].copy()
-        candidates["theme_share"] = candidates[column] / candidates["multi"]
-        themes.append((tag, candidates, "theme_share", False))
-    themes.append(("Active control", pool.loc[pool["incomplete"].eq(0) & pool["balanced_rate"].le(REP_MAX_CONTROL_RATE)], "balanced_rate", True))
-    rankings = [(tag, candidates.sort_values([metric, "groups"], ascending=[ascending, False], kind="stable").index)
-                for tag, candidates, metric, ascending in themes]
-    promoted = {}
-    for _ in range(REP_PER_THEME):  # Interleave themes; avoid duplicate issuers.
-        for tag, order in rankings:
-            next_issuer = next((issuer for issuer in order if issuer not in promoted), None)
-            if next_issuer is not None:
-                promoted[next_issuer] = tag + ("; limited sample" if fallback else "")
-    order = list(promoted) + [issuer for issuer in summary.index if issuer not in promoted]
-    options = [(f"[{promoted[issuer]}] {issuer} | multi={int(summary.loc[issuer, 'multi']):,}/{int(summary.loc[issuer, 'groups']):,}"
-                if issuer in promoted else issuer, issuer) for issuer in order]
-    summary["front_reason"] = pd.Series(promoted)
-    return options, summary
+    # All traded issuers, including quote-absent ones; fixed cases are separate.
+    summary = quality_population["tables"]["Issuer"].copy()
+    summary["groups"], summary["multi"] = summary.events, summary.multi_events
+    summary["balanced_rate"] = summary.unit_equal_multi_rate
+    summary["affected_days"] = summary.affected_unit_rate
+    summary["front_reason"] = ""
+    return [(str(name), name) for name in summary.index], summary
+
 
 def overview_figure(result, page=1):
     g = result["groups"]
@@ -183,13 +152,15 @@ def overview_figure(result, page=1):
     qcounts = qtypes.value_counts().reindex(qlabels, fill_value=0)
     fig = Figure(figsize=(17, 7.5), facecolor="white")
     a, b, c = fig.subplots(1, 3)
-    fig.subplots_adjust(left=0.14, right=0.97, top=0.70, bottom=0.25, wspace=0.62)
+    fig.subplots_adjust(left=0.14, right=0.97, top=0.62, bottom=0.25, wspace=0.62)
     times = result["raw"]["quote_timestamp_ET"].dropna()
     dates = f"{times.min():%Y-%m-%d} to {times.max():%Y-%m-%d} ET" if len(times) else "No valid dates"
     fig.suptitle(f"{result['issuer']}\nStep 2 | Multiple spreads on the same side, at the same time", fontsize=17, y=0.98)
     rate = f"{m / n:.2%}" if n else "N/A"
     fig.text(0.5, 0.84, f"{m:,} of {n:,} events ({rate}) have multiple spreads", ha="center", fontsize=15, weight="bold")
     fig.text(0.5, 0.79, f"{dates} | {len(result['raw']):,} raw rows | {result['repeated_rows']:,} extra identical rows", ha="center", fontsize=11)
+    summary = result["summary"]
+    fig.text(0.5, 0.74, f"Quotes: {int(summary.quoted_bonds):,}/{int(summary.traded_bonds):,} traded bonds | no quote={int(summary.no_quote_bonds):,} | affected bond-days={int(summary.affected_bond_days):,}/{int(summary.observed_bond_days):,}", ha="center", fontsize=10)
     a.barh(np.arange(len(shown)), shown["sum"].div(shown["count"]) * 100, color=QCOLORS[0])
     labels = [f"{firm}\n{int(r['sum']):,}/{int(r['count']):,} ({r['sum'] / r['count']:.2%})" for firm, r in shown.iterrows()]
     a.set_yticks(np.arange(len(shown)), labels, fontsize=9)
@@ -202,8 +173,8 @@ def overview_figure(result, page=1):
            color=[QCOLORS[0], QCOLORS[1], QCOLORS[2], "#E9BA70", QCOLORS[3]])
     b.set_yticks(np.arange(5), [f"{k}\n{v:,}/{m:,} ({v / m:.1%})" if m else f"{k}\nN/A: no multi-spread events" for k, v in qcounts.items()], fontsize=9)
     b.set_ylim(4.6, -0.6)
-    b.set_title("2. What quantities accompany them?\nComposition of all multi-spread events", fontsize=12)
-    b.set_xlabel("Share of issuer's multi-spread events")
+    b.set_title("2. What quantities accompany them?\nComposition of all scope multi-spread events", fontsize=12)
+    b.set_xlabel("Share of scope multi-spread events")
     for axis in [a, b]:
         axis.set_xlim(0, 100)
         axis.xaxis.set_major_formatter(PercentFormatter(100))
@@ -306,7 +277,7 @@ def case_figure(result, event, minutes=None, value_page=1):
 # %% [markdown]
 # ## Select issuer; inspect cases; save the displayed figure
 # Overview includes every keyed group. Case selection offers multi-spread by
-# quantity category, complete single-spread controls and incomplete groups.
+# quantity category, complete single-spread observations and incomplete groups.
 # Dealer/bond/side/date are selectable. Events paginate 50 at a time;
 # every eligible event is accessible and overview statistics are never sampled.
 # Candidate values paginate eight per screenshot. Full day is the default; switch to a local window to zoom.
@@ -320,14 +291,29 @@ if "step2_controls" in globals():
     for control in step2_controls:
         control.unobserve(refresh_step2, names="value")
     save_button.on_click(save_step2, remove=True)
+    scope_box.unobserve(scope_changed, names="value")
+    issuer_box.unobserve(change_issuer, names="value")
+    apply_button.on_click(apply_scope, remove=True)
+    freeze_button.on_click(freeze_cases, remove=True)
+    apply_case_button.on_click(apply_fixed_case, remove=True)
     step2_dashboard.close()
 issuer_options, issuer_summary = representative_issuers()
+scope_box = widgets.Dropdown(options=["Global", "SECTOR", "Dealer", "Issuer"], description="Scope:")
+value_box = widgets.Dropdown(options=["Global"], description="Group:", layout=widgets.Layout(width="650px"))
+apply_button = widgets.Button(description="Apply", button_style="primary")
+freeze_button = widgets.Button(description="Freeze 18 cases", icon="thumb-tack")
+fixed_case_box = widgets.Dropdown(options=[("Freeze once: random 6 / typical 6 / measured impact 6", None)],
+                                 description="Fixed case:", layout=widgets.Layout(width="900px"))
+apply_case_button = widgets.Button(description="Open case")
+case_manifest_status = widgets.HTML()
+case_manifest = quality_population["case_manifest"]
+applied_scope, applied_value = "Global", "Global"
 issuer_box = widgets.Dropdown(options=issuer_options, description="Issuer:", layout=widgets.Layout(width="850px"))
 if not issuer_box.options:
-    raise ValueError("No quote rows remain in the supplied three-month traded-bond universe.")
+    raise ValueError("No traded bonds remain in the supplied universe.")
 view_box = widgets.ToggleButtons(options=["Overview", "Case"], description="View:")
 page_box = widgets.Dropdown(options=[1], description="Dealer page:")
-case_type = widgets.Dropdown(options=["All multi-spread"] + QKINDS + ["Single-spread control", "Incomplete spread"], description="Case type:", layout=widgets.Layout(width="360px"))
+case_type = widgets.Dropdown(options=["All multi-spread"] + QKINDS + ["Single-spread observation", "Incomplete spread"], description="Case type:", layout=widgets.Layout(width="360px"))
 dealer_box = widgets.Dropdown(description="Dealer:", layout=widgets.Layout(width="360px"))
 bond_box = widgets.Dropdown(description="Bond:")
 side_box = widgets.Dropdown(description="Side:")
@@ -350,8 +336,8 @@ def refresh_step2(change=None):
         return
     busy = True
     try:
-        if step2_result is None or step2_result["issuer"] != issuer_box.value:
-            step2_result = analyze_issuer(issuer_box.value)
+        if step2_result is None or step2_result["scope"] != applied_scope or step2_result["value"] != applied_value:
+            step2_result = analyze_scope(applied_scope, applied_value)
             page_box.options = range(1, max(1, (step2_result["groups"]["firm"].nunique() + 7) // 8) + 1)
             page_box.value = 1
         g = step2_result["groups"]
@@ -361,7 +347,9 @@ def refresh_step2(change=None):
         if view_box.value == "Overview":
             current_figure = overview_figure(step2_result, page_box.value)
         else:
-            if case_type.value == "Single-spread control":
+            if case_type.value == "All events":
+                eligible = g
+            elif case_type.value == "Single-spread observation":
                 eligible = g.loc[g["n_spreads"].eq(1) & g["bad_spreads"].eq(0)]
             elif case_type.value == "Incomplete spread":
                 eligible = g.loc[g["bad_spreads"].gt(0)]
@@ -371,7 +359,7 @@ def refresh_step2(change=None):
                     eligible = eligible.loc[eligible["qclass"].eq(case_type.value)]
             # Updating upstream controls resets downstream choices, without nested callbacks.
             chain = [(dealer_box, "firm"), (bond_box, "cusip"), (side_box, "side"), (date_box, "day")]
-            reset = change is not None and change["owner"] in [issuer_box, case_type]
+            reset = change is not None and change["owner"] in [issuer_box, apply_button, apply_case_button, case_type]
             for box, column in chain:
                 options = sorted(eligible[column].unique())
                 previous = box.value
@@ -391,7 +379,7 @@ def refresh_step2(change=None):
                 current_figure = Figure(figsize=(12, 5), facecolor="white")
                 ax = current_figure.subplots()
                 ax.axis("off")
-                ax.text(0.5, 0.5, f"{issuer_box.value}\nNo groups match: {case_type.value}\nChoose another case type or issuer.", ha="center", va="center", fontsize=14)
+                ax.text(0.5, 0.5, f"{step2_result['issuer']}\nNo groups match: {case_type.value}\nChoose another case type or issuer.", ha="center", va="center", fontsize=14)
             else:
                 event = g.loc[event_box.value]
                 rows = step2_result["quotes"]
@@ -409,15 +397,16 @@ def refresh_step2(change=None):
         balanced = f"{r['day_balanced_rate']:.2%}" if r["day_count"] else "N/A"
         affected = f"{r['affected_day_rate']:.2%}" if r["day_count"] else "N/A"
         details.value = (
-            "<details><summary>Counting details and interpretation</summary>"
+            summary_html(r) + "<details><summary>Counting details and interpretation</summary>"
             f"<p>Day-balanced multi-spread rate: {balanced}. Dealer-bond-side-days with any multi-spread: {affected} "
             f"of {r['day_count']:,}. These are dealer/bond/side/day units, not calendar days.</p>"
             "<p>Day-balanced = mean of each unit's multi-spread fraction. "
             "All keyed events, including incomplete ones, stay in denominators. "
             "Unknown quantities take priority over zero, then different/same positive quantities. "
             "Extra identical rows match all loaded fields; unchanged quotes at later timestamps are separate events.</p>"
-            "<p>Front-of-dropdown issuers are selected research cases, not a population sample or a quality ranking. "
-            "No observed multi-spread does not certify a clean issuer.</p></details>"
+            "<p>Fixed cases use seed 2026 and sector/activity strata, with a soft dealer/issuer cap of two. "
+            "High impact uses actual center or 30-minute cutoff coverage changes at first/middle/last local queries. "
+            "Cases are navigation; full population counts never use this sample. No observed multi-spread does not certify a clean issuer.</p></details>"
         )
         # An unmanaged Figure rendered into ONE image widget avoids both inline
         # auto-display and explicit-display paths emitting the same figure twice.
@@ -430,16 +419,87 @@ def refresh_step2(change=None):
 def save_step2(change=None):
     folder = Path("outputs/quote_quality_step2")
     folder.mkdir(parents=True, exist_ok=True)
-    name = "".join(c if c.isalnum() else "_" for c in str(issuer_box.value))[:60]
+    name = "".join(c if c.isalnum() else "_" for c in str(step2_result["issuer"]))[:60]
     suffix = f"overview_{page_box.value}" if view_box.value == "Overview" else f"case_{event_box.value}_values_{values_page.value}_{'day' if window_mode.value == 'Full day' else str(window_box.value) + 'min'}"
     path = folder / f"{name}_{suffix}.png"
     current_figure.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
     save_status.value = f"Saved: {path}"
 
-step2_controls = [issuer_box, view_box, page_box, case_type, dealer_box, bond_box, side_box, date_box, event_page, event_box, window_mode, window_box, values_page]
+def scope_changed(change=None):
+    value_box.options = scope_options(quality_population, scope_box.value)
+    value_box.layout.display = "none" if scope_box.value in ["Global", "Issuer"] else ""
+    issuer_box.layout.display = "" if scope_box.value == "Issuer" else "none"
+    if scope_box.value == "Issuer" and issuer_box.value in value_box.options:
+        value_box.value = issuer_box.value
+
+def apply_scope(change=None):
+    global applied_scope, applied_value, step2_result
+    applied_scope, applied_value = scope_box.value, value_box.value
+    step2_result = None
+    refresh_step2({"owner": apply_button})
+
+def change_issuer(change=None):
+    if busy:
+        return
+    scope_box.value = "Issuer"
+    value_box.value = issuer_box.value
+    apply_scope()
+
+def freeze_cases(change=None):
+    global case_manifest
+    freeze_button.disabled = True
+    case_manifest_status.value = "Measuring rule center/coverage changes at first/middle/last local queries per observed bond/side/day..."
+    try:
+        if quality_population["case_manifest"] is None:
+            case_manifest = fixed_case_manifest(quality_population)
+        else:
+            case_manifest = quality_population["case_manifest"]
+        fixed_case_box.options = [(f"{r.case_number:02}. {r.selection} | {r.ISSUER} | {r.cusip} | {r.side} | {r.day.date()} | {r.firm}", r.case_id)
+                                  for r in case_manifest.itertuples()]
+        fixed_case_box.value = case_manifest.case_id.iloc[0] if len(case_manifest) else None
+        impact = quality_population["impact_table"]
+        case_manifest_status.value = (f"Frozen {len(case_manifest)} cases; exhaustive {len(impact):,} observed bond/side/day groups, "
+                                      f"{int(impact.impact_queries.sum()):,} local queries. High impact cases may be fewer than 6 when no remaining measured effect exists. "
+                                      "Counts remain full population; query effects are descriptive and are not prediction gain.")
+    finally:
+        freeze_button.disabled = False
+
+def apply_fixed_case(change=None):
+    global applied_scope, applied_value, step2_result, busy
+    if case_manifest is None or fixed_case_box.value is None:
+        return
+    row = case_manifest.set_index("case_id").loc[fixed_case_box.value]
+    busy = True
+    try:
+        scope_box.value = "Issuer"
+        issuer_box.value = row.ISSUER
+        value_box.value = row.ISSUER
+        applied_scope, applied_value = "Issuer", row.ISSUER
+        step2_result = analyze_scope(applied_scope, applied_value)
+        view_box.value = "Case"
+        case_type.value = "All events"
+        for box, col in [(dealer_box, "firm"), (bond_box, "cusip"), (side_box, "side"), (date_box, "day")]:
+            box.options = [(str(row[col]), row[col])]
+            box.value = row[col]
+    finally:
+        busy = False
+    refresh_step2()
+    case_manifest_status.value = f"Case {row.case_number}: {row.selection_reason}; events={int(row.events):,}. " +         "Cleaning/feature decision: preserve candidate/quantity ambiguity and check the measured center/coverage cost."
+
+# All-events navigation exposes sparse and one-sided controls selected by the manifest.
+case_type.options = ["All events"] + list(case_type.options)
+step2_controls = [view_box, page_box, case_type, dealer_box, bond_box, side_box, date_box, event_page, event_box, window_mode, window_box, values_page]
 for box in step2_controls:
     box.observe(refresh_step2, names="value")
+scope_box.observe(scope_changed, names="value")
+issuer_box.observe(change_issuer, names="value")
+apply_button.on_click(apply_scope)
+freeze_button.on_click(freeze_cases)
+apply_case_button.on_click(apply_fixed_case)
 save_button.on_click(save_step2)
-step2_dashboard = widgets.VBox([issuer_box, widgets.HBox([view_box, page_box, save_button]), case_controls, details, save_status, plot_output])
+step2_dashboard = widgets.VBox([widgets.HBox([scope_box, value_box, apply_button]), issuer_box,
+    widgets.HBox([freeze_button, apply_case_button]), fixed_case_box, case_manifest_status,
+    widgets.HBox([view_box, page_box, save_button]), case_controls, details, save_status, plot_output])
 display(step2_dashboard)
+scope_changed()
 refresh_step2()

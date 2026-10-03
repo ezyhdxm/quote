@@ -1,6 +1,7 @@
 """Shared calculations for the Step 4/5 research notebooks; no data loading or plotting on import."""
 import numpy as np
 import pandas as pd
+from time import perf_counter
 
 KEYS = ["firm", "cusip", "side", "quote_timestamp_ET"]
 SERIES = KEYS[:3]
@@ -18,15 +19,19 @@ def to_ny_datetime(series):
     return values.dt.tz_convert("America/New_York")
 
 
-def event_history(raw, progress=None):
+def event_history(raw, progress=None, keep_raw=True):
     """Distinct sets and prefix-only changes; optional progress(stage, done, total, detail)."""
+    started = perf_counter()
     if progress is not None:
         progress('events', None, None, f'Normalizing {len(raw):,} quote rows')
-    q = raw.copy()
+    # Duplicate semantics still use the complete source row, while event work needs
+    # only six columns. Extra source metadata no longer travels through groupby.
+    repeats = raw.duplicated()
+    q = raw.copy() if keep_raw else raw[KEYS + ['spread', 'quantity']].copy()
     valid = q[KEYS].notna().all(axis=1)
     for key in SERIES:
         valid &= q[key].astype("string").str.strip().ne("").fillna(False)
-    q["repeat"] = q.duplicated()
+    q["repeat"] = repeats
     q["s"] = pd.to_numeric(q["spread"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     q["q"] = pd.to_numeric(q["quantity"], errors="coerce")
     q["qkind"] = np.select([q["quantity"].isna(), q["q"].eq(0), np.isfinite(q["q"]) & q["q"].gt(0)],
@@ -39,6 +44,7 @@ def event_history(raw, progress=None):
     q["bad"] = q["s"].isna()
     q["pair"] = list(zip(q["s"].fillna("Nonfinite"), q["qtag"]))
     usable = q.loc[valid]
+    normalized = perf_counter()
     if progress is not None:
         progress('events', None, None, f'Aggregating {len(usable):,} keyed quote rows')
     g = usable.groupby(KEYS, observed=True, sort=False).agg(
@@ -48,6 +54,7 @@ def event_history(raw, progress=None):
         pair_set=("pair", lambda v: frozenset(v)),
     ).reset_index().sort_values(SERIES + [KEYS[-1]], kind="stable").reset_index(drop=True)
     g["candidate_count"] = g["spread_set"].map(len)
+    aggregated = perf_counter()
     if progress is not None:
         progress('events', None, None, f'Building history for {len(g):,} events')
     for col, fn in [("lo", min), ("hi", max), ("center", np.median)]:
@@ -89,7 +96,22 @@ def event_history(raw, progress=None):
         g.loc[idx, "changes_30m"] = counts[1:] - counts[left]
         if progress is not None and (completed % max(1, (len(segments) + 99) // 100) == 0 or completed == len(segments)):
             progress('events', completed, len(segments), f'History segments {completed:,}/{len(segments):,}')
-    return {"raw": q, "events": g, "unkeyed": int((~valid).sum())}
+    result = {"events": g, "unkeyed": int((~valid).sum()),
+              "timings": {'normalize_s': normalized-started,
+                          'aggregate_s': aggregated-normalized,
+                          'history_s': perf_counter()-aggregated}}
+    if keep_raw:
+        result['raw'] = q
+    return result
+
+
+def prepare_quote_events(quotes, progress=None):
+    """Reusable narrow event table. Rebuild explicitly after changing source quotes.
+
+    It retains incomplete latest messages; an incomplete message is observed state,
+    not an absent quote. No hidden cache can silently reuse a changed DataFrame.
+    """
+    return event_history(quotes, progress=progress, keep_raw=False)
 
 
 
@@ -137,7 +159,6 @@ def pair_snapshots(events, times, age_min=30, sync_min=1, allow_exact=True):
     p['max_age'] = p[['age_bid','age_ask']].max(axis=1).where(p.both)
     p['time_gap'] = (pd.to_datetime(p[f'{KEYS[-1]}_bid']) - pd.to_datetime(p[f'{KEYS[-1]}_ask'])).abs().dt.total_seconds()/60
     p['same_time'] = p.both & p['time_gap'].eq(0)
-    p['fresh_pair'] = p.complete & p.max_age.le(age_min)
     for name in ['gap_low','gap_high','gap_center','mid','mid_range','matched_gap_low','matched_gap_high','matched_gap','matched_mid']:
         p[name] = np.nan
     p['positive_matches'] = 0
@@ -170,12 +191,74 @@ def pair_snapshots(events, times, age_min=30, sync_min=1, allow_exact=True):
         matches.append(cache[key])
     if matches:
         p.loc[p.complete,matched_columns] = pd.DataFrame(matches,index=p.index[p.complete],columns=matched_columns)
-    p['size_time_pair'] = p.fresh_pair & p.time_gap.le(sync_min) & p.positive_matches.gt(0)
     for suffix,lo,hi,eligible in [('', 'gap_low','gap_high',p.complete),
                                   ('_matched','matched_gap_low','matched_gap_high',p.positive_matches.gt(0))]:
         p['cross'+suffix] = 'Unassessed'
         p.loc[eligible,'cross'+suffix] = np.select([p.loc[eligible,lo].ge(0),p.loc[eligible,hi].lt(0)],['None','All'],default='Some')
-    return p.sort_values(['time','firm'],kind='stable').reset_index(drop=True)
+    p = p.sort_values(['time','firm'],kind='stable').reset_index(drop=True)
+    return pair_policy_masks(p, age_min, sync_min)
+
+
+def pair_policy_masks(pairs, age_min=30, sync_min=1):
+    """Derive age/sync eligibility from cached all-dealer state, without as-of work."""
+    if age_min <= 0 or sync_min < 0:
+        raise ValueError('age_min must be positive and sync_min nonnegative')
+    p = pairs.copy()
+    p['fresh_pair'] = p.complete & p.max_age.le(age_min)
+    p['size_time_pair'] = p.fresh_pair & p.time_gap.le(sync_min) & p.positive_matches.gt(0)
+    return p
+
+
+def pair_policy_comparison(pairs):
+    """A→B isolates slot selection; B→C isolates candidate matching on identical slots.
+
+    Slots are all-dealer bond/day grid observations, not independent trades. B is
+    eligible for size/time matching but uses its original candidate sets. C uses
+    shared positive raw-quantity candidates on exactly those same B slots.
+    """
+    rows = []
+    for label, mask, cross, gap, mid in [
+        ('A fresh / original', pairs.fresh_pair, 'cross', 'gap_center', 'mid'),
+        ('B match slots / original', pairs.size_time_pair, 'cross', 'gap_center', 'mid'),
+        ('C same slots / matched', pairs.size_time_pair, 'cross_matched', 'matched_gap', 'matched_mid')]:
+        z = pairs.loc[mask]
+        rows.append(dict(policy=label, n_slots=len(z), n_dealers=z.firm.nunique(),
+            gap_mean_bps=z[gap].mean(), mid_mean_bps=z[mid].mean(),
+            **{state.lower()+'_fraction': z[cross].eq(state).mean() for state in ['None', 'Some', 'All']}))
+    return pd.DataFrame(rows).set_index('policy')
+
+
+def pair_extreme_sources(raw, pairs, limit_each=2):
+    """Locate both signed gap extremes in original bid/ask spread and quantity rows.
+
+    Repeated grid observations of one candidate-state pair count once here. Boundary
+    flags identify the raw candidates creating the extrema; other raw candidates in
+    those messages remain visible. This diagnoses provenance without deleting rows.
+    """
+    columns = ['extreme', 'time', 'firm', 'side', 'quote_timestamp_ET', 'spread',
+               'quantity', 'boundary_candidate', 'gap_bound_bps']
+    if 'cusip' in raw and raw.cusip.nunique() > 1:
+        raise ValueError('pair_extreme_sources expects raw rows for one bond')
+    if limit_each < 1:
+        return pd.DataFrame(columns=columns)
+    distinct = pairs.loc[pairs.fresh_pair].drop_duplicates(
+        ['firm', 'quote_timestamp_ET_bid', 'quote_timestamp_ET_ask'])
+    sources = []
+    for label, field, ascending, bounds in [
+        ('Low gap boundary', 'gap_low', True, {'bid': 'lo', 'ask': 'hi'}),
+        ('High gap boundary', 'gap_high', False, {'bid': 'hi', 'ask': 'lo'})]:
+        selected = distinct.sort_values(field, ascending=ascending, kind='stable').head(limit_each)
+        for row in selected.itertuples():
+            for side in ['bid', 'ask']:
+                stamp = getattr(row, 'quote_timestamp_ET_'+side)
+                z = raw.loc[raw.firm.eq(row.firm) & raw.side.eq(side) & raw.quote_timestamp_ET.eq(stamp)]
+                for source in z.itertuples():
+                    value = pd.to_numeric(pd.Series([source.spread]), errors='coerce').iloc[0]
+                    sources.append(dict(extreme=label, time=row.time, firm=row.firm, side=side,
+                        quote_timestamp_ET=stamp, spread=source.spread, quantity=source.quantity,
+                        boundary_candidate=bool(np.isfinite(value) and value == getattr(row, bounds[side]+'_'+side)),
+                        gap_bound_bps=getattr(row, field)))
+    return pd.DataFrame(sources, columns=columns)
 
 
 def pair_features(pairs, times):
@@ -210,34 +293,91 @@ def pair_features(pairs, times):
     return f
 
 
-def build_quote_features(quotes, queries, age_min=30, sync_min=1, allow_exact=True, progress=None):
-    """queries: row_id,cusip,time. Preserve every query, including absent quotes and bonds."""
+def empty_quote_features(times):
+    """The same zero-count/NaN schema as real as-of calculations, with no dealer work."""
+    index = pd.DatetimeIndex(times).sort_values().unique()
+    sides = ['center_equal','n_dealers','n_fresh_dealers','n_incomplete','center_decay',
+             'center_max_age','dispersion_bps','mean_candidate_gap','multi_fraction',
+             'zero_quantity_fraction','unknown_quantity_fraction','median_message_age_min',
+             'median_change_age_min','unknown_change_age_fraction','center_lower','center_upper',
+             'max_decay_weight_share','decay_effective_dealers','center_candidate_clip',
+             'center_dealer_downweight','n_peer_supported','n_clipped_dealers','n_changed_centers']
+    counts = ['n_dealers','n_fresh_dealers','n_incomplete','n_peer_supported','n_clipped_dealers','n_changed_centers']
+    pieces = []
+    for side in ['bid', 'ask']:
+        f = pd.DataFrame(np.nan, index=index, columns=sides)
+        # Match side_features_fast's integer count dtypes as well as its values.
+        for count in counts:
+            f[count] = np.zeros(len(index), dtype=int)
+        pieces.append(f.add_prefix('bcq_'+side+'_'))
+    empty_pairs = pd.DataFrame(columns=['fresh_pair', 'size_time_pair'])
+    pieces.append(pair_features(empty_pairs, index).add_prefix('bcq_'))
+    result = pd.concat(pieces, axis=1)
+    result['bcq_has_quote'] = 0.0
+    result.index.name = 'time'
+    return result
+
+
+def build_quote_features(quotes, queries, age_min=30, sync_min=1, allow_exact=True, progress=None, event_cache=None):
+    """Preserve every query. Optional prepare_quote_events result avoids repeated event work.
+
+    Timings and skipped no-state query counts are attached to result.attrs. Empty
+    bond/day and before-first queries skip both side matrices and pair snapshots;
+    latest incomplete messages still use the full path to preserve n_incomplete.
+    """
     if queries.row_id.duplicated().any() or queries[['row_id','cusip','time']].isna().any().any():
         raise ValueError('Queries require unique row_id and nonmissing cusip/time')
-    output=[]
-    grouped=quotes.groupby('cusip',observed=True)
+    if age_min <= 0 or sync_min < 0:
+        raise ValueError('age_min must be positive and sync_min nonnegative')
+    started = perf_counter()
+    cache_reused = event_cache is not None
     query_groups=queries.groupby('cusip',sort=False,observed=True)
     if progress is not None:
         progress('features', 0, query_groups.ngroups, f'{len(queries):,} trade queries across {query_groups.ngroups:,} bonds')
+    if queries.empty:
+        result = queries.copy()
+        result.attrs['quote_feature_timings'] = dict(event_prepare_s=0.0, asof_s=0.0,
+            total_s=perf_counter()-started, no_state_unique_queries=0, event_cache_reused=cache_reused)
+        return result
+    if event_cache is None:
+        relevant = quotes.loc[quotes.cusip.isin(queries.cusip.unique())]
+        event_cache = prepare_quote_events(relevant, progress=progress)
+    all_events = event_cache['events']
+    prepared = perf_counter()
+    output=[]
+    grouped=all_events.groupby('cusip',observed=True)
+    skipped = 0
     for completed,(bond,q) in enumerate(query_groups, 1):
         if progress is not None:
             progress('features', completed-1, query_groups.ngroups, f'Bond {bond}: {len(q):,} trade queries')
-        raw=grouped.get_group(bond) if bond in grouped.groups else quotes.iloc[:0]
-        events=event_history(raw, progress=progress)['events']
+        events=grouped.get_group(bond) if bond in grouped.groups else all_events.iloc[:0]
         times=pd.DatetimeIndex(q.time).sort_values().unique()
-        pieces=[]
-        for side in ['bid','ask']:
-            f=side_features_fast(events.loc[events.side.eq(side)],times,age_min,allow_exact)
-            pieces.append(f.add_prefix(f'bcq_{side}_'))
-        p=pair_snapshots(events,times,age_min,sync_min,allow_exact)
-        pieces.append(pair_features(p,times).add_prefix('bcq_'))
-        f=pd.concat(pieces,axis=1)
-        f['bcq_has_quote']=(f.bcq_bid_n_dealers.add(f.bcq_ask_n_dealers).gt(0)).astype(float)
+        first = events.groupby('day', observed=True)[KEYS[-1]].min()
+        first_at_query = pd.Series(times.normalize(), index=times).map(first)
+        active = first_at_query.notna() & (first_at_query.le(times) if allow_exact else first_at_query.lt(times))
+        active_times = times[active.to_numpy()]
+        skipped += int((~active).sum())
+        f = empty_quote_features(times)
+        if len(active_times):
+            pieces=[]
+            for side in ['bid','ask']:
+                side_f=side_features_fast(events.loc[events.side.eq(side)],active_times,age_min,allow_exact)
+                pieces.append(side_f.add_prefix(f'bcq_{side}_'))
+            p=pair_snapshots(events,active_times,age_min,sync_min,allow_exact)
+            pieces.append(pair_features(p,active_times).add_prefix('bcq_'))
+            active_f=pd.concat(pieces,axis=1)
+            active_f['bcq_has_quote']=(active_f.bcq_bid_n_dealers.add(active_f.bcq_ask_n_dealers).gt(0)).astype(float)
+            f.loc[active_times] = active_f
         joined=q[['row_id','cusip','time']].merge(f,left_on='time',right_index=True,how='left',validate='many_to_one')
         output.append(joined)
         if progress is not None:
             progress('features', completed, query_groups.ngroups, f'Finished bond {bond}: {len(q):,} trade queries')
-    return pd.concat(output,ignore_index=True).set_index('row_id').reindex(queries.row_id).reset_index() if output else queries.copy()
+    result = pd.concat(output,ignore_index=True).set_index('row_id').reindex(queries.row_id).reset_index() if output else queries.copy()
+    result.attrs['quote_feature_timings'] = dict(event_prepare_s=prepared-started,
+        asof_s=perf_counter()-prepared, total_s=perf_counter()-started,
+        no_state_unique_queries=skipped, event_cache_reused=cache_reused,
+        **event_cache.get('timings', {}))
+    return result
 
 
 def side_features_fast(events, times, age_min=30, allow_exact=True):

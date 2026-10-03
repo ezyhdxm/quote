@@ -15,6 +15,9 @@ import matplotlib.dates as mdates
 from matplotlib.ticker import MaxNLocator
 import ipywidgets as widgets
 from IPython.display import display
+from time import perf_counter
+from quote_quality_core import event_history, side_features_fast
+from quote_quality_cache import prepare_quote_events
 
 PIPELINE_CSV = Path("data/pipeline/data_pipeline.csv_20260506")
 BENCHMARK_CSV = Path("data/pipeline/DailyCloseUSTBenchmarks.csv_20260506")
@@ -73,187 +76,146 @@ issuer_labels = bcq_df["ISSUER"].astype("string").fillna("[Missing issuer]")
 VIEWS = ["1 Candidates", "2 Quantity", "3 Age", "4 Influence"]
 ALL_VIEWS = "All four"
 
+# Event construction is shared across issuers. Source rows remain in bcq_df;
+# only the narrow diagnostic columns travel through the case interface.
+if globals().get("step3_source") is not bcq_df:
+    step3_prepared = prepare_quote_events(bcq_df)
+    step3_source = bcq_df
+    step3_raw = bcq_df[KEYS + ["spread", "quantity", "ISSUER"]].copy()
+    step3_raw["repeat"] = bcq_df.duplicated()
+    step3_raw["s"] = pd.to_numeric(step3_raw.spread, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    step3_raw["q"] = pd.to_numeric(step3_raw.quantity, errors="coerce")
+    step3_raw["qkind"] = np.select(
+        [step3_raw.quantity.isna(), step3_raw.q.eq(0), np.isfinite(step3_raw.q) & step3_raw.q.gt(0)],
+        ["Missing", "Zero", "Positive"], default="Other")
+    step3_raw["qtag"] = step3_raw.qkind.astype(str)
+    positive = step3_raw.qkind.eq("Positive")
+    step3_raw.loc[positive, "qtag"] = step3_raw.loc[positive, "q"].map(lambda v: "q=" + repr(float(v)))
+    other = step3_raw.qkind.eq("Other")
+    step3_raw.loc[other, "qtag"] = "Other:" + step3_raw.loc[other, "quantity"].astype(str)
+    step3_raw["bad"] = step3_raw.s.isna()
+    step3_case_cache = {}
+    step3_population = None
+    step3_manifest = None
+
 
 def issuer_choices():
-    """Lightweight global ranking; detailed event histories are built on demand."""
-    x = bcq_df[KEYS + ["spread", "quantity"]].assign(issuer=issuer_labels)
-    x["spread"] = pd.to_numeric(x["spread"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    size = pd.to_numeric(x["quantity"], errors="coerce")
-    x["positive_q"] = size.where(np.isfinite(size) & size.gt(0))
-    g = x.dropna(subset=KEYS).groupby(["issuer"] + KEYS, observed=True).agg(
-        lo=("spread", "min"), hi=("spread", "max"), n=("spread", "nunique"), nq=("positive_q", "nunique"),
-    ).reset_index()
-    g["multi"], g["size_multi"] = g["n"].gt(1), g["n"].gt(1) & g["nq"].gt(1)
-    g["gap"] = (g["hi"] - g["lo"]).where(g["multi"])
-    g["day"] = g["quote_timestamp_ET"].dt.normalize()
+    """Rank the shared event table; navigation labels are descriptive only."""
+    g = step3_prepared["events"].copy()
+    g["issuer"] = g.cusip.map(cusip_issuer).astype("string").fillna("[Missing issuer]")
+    g["multi"] = g.candidate_count.gt(1)
+    g["size_multi"] = g["multi"] & g.quantity_set.map(lambda tags: sum(t.startswith("q=") for t in tags) > 1)
     scores = g.groupby("issuer", observed=True).agg(
-        events=("n", "size"), multi=("multi", "sum"), size_multi=("size_multi", "sum"),
-        days=("day", "nunique"), dealers=("firm", "nunique"), gap=("gap", "median"),
-    )
+        events=("candidate_count", "size"), multi=("multi", "sum"), size_multi=("size_multi", "sum"),
+        days=("day", "nunique"), dealers=("firm", "nunique"), gap=("gap", "median"))
     scores["rate"] = scores["multi"] / scores["events"]
-    supported = scores.loc[scores["events"].ge(100) & scores["days"].ge(2) & scores["dealers"].ge(2)]
-    multi = supported.loc[supported["multi"].ge(5)]
+    supported = scores.loc[scores.events.ge(100) & scores.days.ge(2) & scores.dealers.ge(2)]
+    multi = supported.loc[supported.multi.ge(5)]
     promoted = {}
-    # Previously inspected cases remain easy to find, when present in this load.
-    for prefix, reason in [("SKY GROUP", "Prior multi"), ("EASTERN GAS", "Prior multi"),
-                           ("DUKE ENERGY", "Prior quantity"), ("IBM", "Prior same size"),
-                           ("EXPAND ENERGY", "Prior wide"), ("HPS CORPORATE", "Prior wide"),
-                           ("COMCAST", "Prior control"), ("MITSUBISHI UFJ", "Prior control")]:
+    for prefix in ["SKY GROUP", "EASTERN GAS", "DUKE ENERGY", "IBM", "EXPAND ENERGY", "HPS CORPORATE", "COMCAST", "MITSUBISHI UFJ"]:
         for name in sorted(issuer_labels.unique()):
             if name.upper().startswith(prefix):
-                promoted[name] = reason
+                promoted[name] = "Reviewed case"
                 break
     for tag, pool, field, ascending in [
         ("Multi", multi, "rate", False), ("Wide", multi, "gap", False),
-        ("Quantity", multi.loc[multi["size_multi"].ge(5)], "size_multi", False),
-        ("Control", supported, "rate", True),
-    ]:
+        ("Quantity", multi.loc[multi.size_multi.ge(5)], "size_multi", False),
+        ("Low synchronous multi", supported, "rate", True)]:
         for name in pool.sort_values([field, "events"], ascending=[ascending, False]).index[:2]:
             promoted.setdefault(name, tag)
     order = list(promoted) + [n for n in sorted(issuer_labels.unique()) if n not in promoted]
     return [(f"[{promoted[n]}] {n}" if n in promoted else n, n) for n in order]
 
 
-def event_history(raw):
-    """Distinct numeric spread / raw-size-condition sets, with prefix-only changes."""
-    q = raw.copy()
-    valid = q[KEYS].notna().all(axis=1)
-    for key in SERIES:
-        valid &= q[key].astype("string").str.strip().ne("").fillna(False)
-    q["repeat"] = q.duplicated()
-    q["s"] = pd.to_numeric(q["spread"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    q["q"] = pd.to_numeric(q["quantity"], errors="coerce")
-    q["qkind"] = np.select([q["quantity"].isna(), q["q"].eq(0), np.isfinite(q["q"]) & q["q"].gt(0)],
-                            ["Missing", "Zero", "Positive"], default="Other")
-    q["qtag"] = q["qkind"].astype(str)
-    positive = q["qkind"].eq("Positive")
-    q.loc[positive, "qtag"] = q.loc[positive, "q"].map(lambda v: "q=" + repr(float(v)))
-    other = q["qkind"].eq("Other")
-    q.loc[other, "qtag"] = "Other:" + q.loc[other, "quantity"].astype(str)
-    q["bad"] = q["s"].isna()
-    q["pair"] = list(zip(q["s"].fillna("Nonfinite"), q["qtag"]))
-    usable = q.loc[valid]
-    g = usable.groupby(KEYS, observed=True, sort=False).agg(
-        rows=("s", "size"), repeats=("repeat", "sum"), bad=("bad", "sum"),
-        spread_set=("s", lambda v: tuple(sorted(v.dropna().unique()))),
-        quantity_set=("qtag", lambda v: tuple(sorted(v.unique()))),
-        pair_set=("pair", lambda v: frozenset(v)),
-    ).reset_index().sort_values(SERIES + [KEYS[-1]], kind="stable").reset_index(drop=True)
-    g["candidate_count"] = g["spread_set"].map(len)
-    for col, fn in [("lo", min), ("hi", max), ("center", np.median)]:
-        g[col] = g["spread_set"].map(lambda v: float(fn(v)) if v else np.nan)
-    g["gap"] = g["hi"] - g["lo"]
-    g["center_nearest_gap"] = [min(abs(s - c) for s in ss) if ss else np.nan
-                               for ss, c in zip(g["spread_set"], g["center"])]
-    g["complete"] = g["bad"].eq(0) & g["candidate_count"].gt(0)
-    g["day"] = g[KEYS[-1]].dt.normalize()
-    group = g.groupby(SERIES + ["day"], sort=False, observed=True)
-    prev = group[["spread_set", "quantity_set", "pair_set", "complete", "candidate_count", "center", KEYS[-1]]].shift()
-    g["interval_min"] = (g[KEYS[-1]] - prev[KEYS[-1]]).dt.total_seconds() / 60
-    continuous = g["interval_min"].le(HISTORY_GAP_MIN) & g["complete"] & prev["complete"].eq(True)
-    g["history_break"] = ~continuous
-    g["spread_changed"] = continuous & g["spread_set"].ne(prev["spread_set"])
-    g["pair_refresh"] = continuous & g["pair_set"].eq(prev["pair_set"])
-    g["condition_changed"] = continuous & (g["quantity_set"].ne(prev["quantity_set"]) | g["candidate_count"].ne(prev["candidate_count"]))
-    g["center_delta"] = (g["center"] - prev["center"]).where(continuous)
-    g["guarded_delta"] = g["center_delta"].where(~g["condition_changed"])
-    # Bounds are order statistics, not tracked quote identities.
-    for bound in ["lo", "hi"]:
-        g[f"{bound}_delta"] = group[bound].diff().where(continuous & ~g["condition_changed"])
-    two_back = group["pair_set"].shift(2)
-    g["observed_aba"] = continuous & group["history_break"].shift().eq(False) & g["pair_set"].eq(two_back) & g["pair_set"].ne(prev["pair_set"])
-    # Break on day/series changes, incomplete observations, or a long gap.
-    segment = g["history_break"].cumsum()
-    g["history_start"] = g.groupby(segment)[KEYS[-1]].transform("first")
-    g["last_change"] = g[KEYS[-1]].where(g["spread_changed"]).groupby(segment).ffill()
-    g["change_age_min"] = (g[KEYS[-1]] - g["last_change"]).dt.total_seconds() / 60
-    g["change_age_unknown"] = g["last_change"].isna()
-    g["changes_30m"] = 0
-    for _, idx in g.groupby(segment).groups.items():
-        times = g.loc[idx, KEYS[-1]].array.as_unit("ns").asi8
-        counts = np.r_[0, g.loc[idx, "spread_changed"].to_numpy().cumsum()]
-        left = np.searchsorted(times, times - LOOKBACK_MIN * 60 * 10**9, side="right")
-        g.loc[idx, "changes_30m"] = counts[1:] - counts[left]
-    return {"raw": q, "events": g, "unkeyed": int((~valid).sum())}
-
-
 def asof_features(events, times, age_min=DEFAULT_AGE_MIN):
-    """One bond/side. Same-day as-of, dealer-capped comparisons; no future peers."""
+    """Fast shared summaries plus case slots and fixed-lag composition diagnostics."""
+    from quote_quality_core import side_features_fast
     requested = pd.DatetimeIndex(times).sort_values().unique()
-    # Fixed-horizon changes cannot depend on how many query rows the caller asks for.
     lagged = requested - pd.Timedelta(minutes=LOOKBACK_MIN)
-    times = requested.union(lagged)
-    base = pd.DataFrame({"time": times})
+    queries = requested.union(lagged)
+    features = side_features_fast(events, queries, age_min)
+    base = pd.DataFrame({"time": queries})
     parts = []
     for firm, history in events.groupby("firm", observed=True):
         merged = pd.merge_asof(base, history.sort_values(KEYS[-1]), left_on="time", right_on=KEYS[-1], direction="backward")
-        merged = merged.loc[merged[KEYS[-1]].notna() & merged["time"].dt.normalize().eq(merged["day"])].copy()
+        merged = merged.loc[merged[KEYS[-1]].notna() & merged.time.dt.normalize().eq(merged.day)].copy()
         if merged.empty:
             continue
         merged[["complete", "change_age_unknown"]] = merged[["complete", "change_age_unknown"]].astype(bool)
-        merged["message_age_min"] = (merged["time"] - merged[KEYS[-1]]).dt.total_seconds() / 60
-        merged["spread_set_change_age_min"] = (merged["time"] - merged["last_change"]).dt.total_seconds() / 60
-        merged["observed_history_min"] = (merged["time"] - merged["history_start"]).dt.total_seconds() / 60
+        merged["message_age_min"] = (merged.time - merged[KEYS[-1]]).dt.total_seconds() / 60
+        merged["spread_set_change_age_min"] = (merged.time - merged.last_change).dt.total_seconds() / 60
+        merged["observed_history_min"] = (merged.time - merged.history_start).dt.total_seconds() / 60
         parts.append(merged)
-    slots = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-    columns = ["center_equal", "center_decay", "center_max_age", "center_candidate_clip", "center_dealer_downweight",
-               "n_dealers", "n_fresh_dealers", "n_incomplete", "dispersion_bps", "mean_candidate_gap",
-               "multi_fraction", "zero_quantity_fraction", "unknown_quantity_fraction", "median_message_age_min", "median_change_age_min", "unknown_change_age_fraction",
-               "max_decay_weight_share", "n_peer_supported", "n_clipped_dealers",
-               "decay_effective_dealers", "center_lower", "center_upper", "n_changed_centers"]
-    features = pd.DataFrame(index=times, columns=columns, dtype=float)
-    features.index.name = "time"
-    features[["n_dealers", "n_fresh_dealers", "n_incomplete", "n_peer_supported", "n_clipped_dealers", "n_changed_centers"]] = 0
-    if slots.empty:
-        features["center_delta_30m"], features["composition_changed_30m"] = np.nan, np.nan
-        return slots, features.reindex(requested)
-    composition = {}
+    slots = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=list(events.columns) + ["time", "message_age_min", "spread_set_change_age_min", "observed_history_min"])
+    n, dealers = len(queries), pd.Index(events.firm.drop_duplicates())
+    d = len(dealers)
+    center = np.full((n, d), np.nan)
+    age = np.full((n, d), np.nan)
+    conditions = np.full((n, d), -1, dtype=int)
     slots["peer_center"], slots["peer_radius"], slots["peer_residual"] = np.nan, np.nan, np.nan
-    slots["n_peers"] = 0
-    slots["clipped_candidate_count"] = 0
+    slots["n_peers"], slots["clipped_candidate_count"] = 0, 0
     slots["clipped_center"], slots["dealer_weight"] = slots["center"], 1.0
-    for t, idx in slots.groupby("time", sort=False).groups.items():
-        block = slots.loc[idx]
-        valid = block.loc[block["complete"]]
-        fresh = valid.loc[valid["message_age_min"].le(age_min)]
-        for i, row in valid.iterrows():
-            peers = fresh.loc[fresh["firm"].ne(row["firm"]), "center"]
-            slots.loc[i, "n_peers"] = len(peers)
-            if len(peers) < MIN_PEERS:
+    if len(slots):
+        ti, di = queries.get_indexer(slots.time), dealers.get_indexer(slots.firm)
+        complete = slots.complete.to_numpy(dtype=bool)
+        center[ti[complete], di[complete]] = slots.loc[complete, "center"]
+        age[ti[complete], di[complete]] = slots.loc[complete, "message_age_min"]
+        codes, _ = pd.factorize(pd.Series(list(zip(slots.quantity_set, slots.candidate_count))))
+        conditions[ti[complete], di[complete]] = codes[complete]
+        fresh = np.isfinite(center) & (age <= age_min)
+        # Loop over dealers, with all query times handled in arrays. No per-slot
+        # DataFrame slicing/iterrows; peers always exclude the target dealer.
+        for j in range(d):
+            own_rows = np.flatnonzero((di == j) & complete)
+            if not len(own_rows):
                 continue
-            ref = peers.median()
-            radius = max(CLIP_FLOOR_BPS, MAD_MULTIPLIER * 1.4826 * (peers - ref).abs().median())
-            residual = row["center"] - ref
-            clipped = np.median(np.clip(row["spread_set"], ref - radius, ref + radius))
-            slots.loc[i, "clipped_candidate_count"] = int((np.abs(np.asarray(row["spread_set"]) - ref) > radius).sum())
-            slots.loc[i, ["peer_center", "peer_radius", "peer_residual", "clipped_center", "dealer_weight"]] = [
-                ref, radius, residual, clipped, min(1.0, radius / abs(residual)) if residual else 1.0,
-            ]
-        features.loc[t, ["n_dealers", "n_fresh_dealers", "n_incomplete"]] = [len(valid), len(fresh), int(block["complete"].eq(False).sum())]
-        if valid.empty:
-            continue
-        v = slots.loc[valid.index]
-        composition[t] = tuple(sorted((str(r.firm), r.quantity_set, r.candidate_count) for r in v.itertuples()))
-        # Relative ages preserve normalized weights and avoid all-weight underflow.
-        weights = np.exp2(-(v["message_age_min"] - v["message_age_min"].min()) / age_min)
-        supported = v["n_peers"].ge(MIN_PEERS)
-        clipped = supported & v["clipped_candidate_count"].gt(0)
-        changed = supported & ~np.isclose(v["clipped_center"], v["center"], rtol=0, atol=1e-9)
-        features.loc[t] = [v["center"].mean(), np.average(v["center"], weights=weights),
-            fresh["center"].mean(), v["clipped_center"].mean(), np.average(v["center"], weights=v["dealer_weight"]),
-            len(v), len(fresh), int(block["complete"].eq(False).sum()), v["center"].std(ddof=0), v["gap"].mean(),
-            v["candidate_count"].gt(1).mean(), v["quantity_set"].map(lambda tags: "Zero" in tags).mean(),
-            v["quantity_set"].map(lambda tags: any(tag == "Missing" or tag.startswith("Other:") for tag in tags)).mean(),
-            v["message_age_min"].median(), v["spread_set_change_age_min"].dropna().median() if v["spread_set_change_age_min"].notna().any() else np.nan,
-            v["change_age_unknown"].mean(), weights.max() / weights.sum(), int(supported.sum()), int(clipped.sum()),
-            weights.sum()**2 / (weights**2).sum(), v["lo"].mean(), v["hi"].mean(), int(changed.sum())]
+            own_time = ti[own_rows]
+            peer_mask = fresh[own_time].copy()
+            peer_mask[:, j] = False
+            counts = peer_mask.sum(axis=1)
+            slots.loc[own_rows, "n_peers"] = counts
+            supported = counts >= MIN_PEERS
+            if not supported.any():
+                continue
+            idx = own_rows[supported]
+            peers = np.where(peer_mask[supported], center[own_time[supported]], np.nan)
+            ref = np.nanmedian(peers, axis=1)
+            radius = np.maximum(CLIP_FLOOR_BPS, MAD_MULTIPLIER * 1.4826 * np.nanmedian(np.abs(peers - ref[:, None]), axis=1))
+            residual = slots.loc[idx, "center"].to_numpy() - ref
+            candidate_sets = slots.loc[idx, "spread_set"]
+            middle_low = candidate_sets.map(lambda x: x[(len(x) - 1) // 2]).to_numpy()
+            middle_high = candidate_sets.map(lambda x: x[len(x) // 2]).to_numpy()
+            clipped = (np.clip(middle_low, ref - radius, ref + radius) + np.clip(middle_high, ref - radius, ref + radius)) / 2
+            weights = np.minimum(1, np.divide(radius, np.abs(residual), out=np.ones(len(idx)), where=residual != 0))
+            slots.loc[idx, ["peer_center", "peer_radius", "peer_residual", "clipped_center", "dealer_weight"]] = np.column_stack([ref, radius, residual, clipped, weights])
+        supported = slots.n_peers.ge(MIN_PEERS)
+        if supported.any():
+            candidates = slots.loc[supported, ["spread_set", "peer_center", "peer_radius"]].explode("spread_set")
+            clipped = (pd.to_numeric(candidates.spread_set) - candidates.peer_center).abs().gt(candidates.peer_radius)
+            slots.loc[supported, "clipped_candidate_count"] = clipped.groupby(level=0).sum().reindex(slots.index[supported]).to_numpy()
     now = features.reindex(requested).copy()
     before = features.reindex(lagged).set_axis(requested)
-    eligible = now["n_dealers"].gt(0) & before["n_dealers"].gt(0) & (requested.normalize() == lagged.normalize())
-    changed = pd.Series([composition.get(t) != composition.get(old) for t, old in zip(requested, lagged)], index=requested)
-    now["composition_changed_30m"] = changed.astype(float).where(eligible)
-    now["center_delta_30m"] = (now["center_equal"] - before["center_equal"]).where(eligible & ~changed)
-    return slots.loc[slots["time"].isin(requested)].reset_index(drop=True), now
+    ni, pi = queries.get_indexer(requested), queries.get_indexer(lagged)
+    same_day = np.asarray(requested.normalize() == lagged.normalize())
+    now_present, past_present = np.isfinite(center[ni]), np.isfinite(center[pi])
+    common = now_present & past_present & same_day[:, None]
+    common_n = common.sum(axis=1)
+    eligible = now.n_dealers.gt(0) & before.n_dealers.gt(0) & same_day
+    composition_changed = (now_present != past_present).any(axis=1) | ((conditions[ni] != conditions[pi]) & common).any(axis=1)
+    now["composition_changed_30m"] = pd.Series(composition_changed, index=requested).astype(float).where(eligible)
+    aggregate_delta = (now.center_equal - before.center_equal).where(eligible)
+    # Preserve the old guarded feature; the new diagnostic retains common dealer
+    # changes even when quantity support/candidate count changes.
+    now["center_delta_30m"] = aggregate_delta.where(~composition_changed)
+    now["aggregate_delta_30m"] = aggregate_delta
+    common_difference = np.where(common, center[ni] - center[pi], np.nan)
+    now["common_dealer_delta_30m"] = np.divide(np.nansum(common_difference, axis=1), common_n, out=np.full(len(requested), np.nan), where=common_n > 0)
+    now["n_common_dealers_30m"] = common_n
+    now["common_retention_30m"] = np.divide(common_n, now.n_dealers.to_numpy(), out=np.full(len(requested), np.nan), where=now.n_dealers.to_numpy() > 0)
+    now["past_common_retention_30m"] = np.divide(common_n, before.n_dealers.to_numpy(), out=np.full(len(requested), np.nan), where=before.n_dealers.to_numpy() > 0)
+    changed_n = ((conditions[ni] != conditions[pi]) & common).sum(axis=1)
+    now["common_condition_changed_fraction_30m"] = np.divide(changed_n, common_n, out=np.full(len(requested), np.nan), where=common_n > 0)
+    return slots.loc[slots.time.isin(requested)].reset_index(drop=True), now
 
 
 def quantity_evidence(rows):
@@ -317,17 +279,16 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
         a.set_title("Raw levels and their scalar summary")
         b.scatter(e[KEYS[-1]], e["gap"], s=17, color="#8560A5")
         b.set_title("Same-time candidate gap"); b.set_ylabel("max - min (bps)")
-        c.scatter(e[KEYS[-1]], e["center_delta"], s=16, color="#BBBBBB", label="Center: all changes")
-        for col, label, color, marker in [("guarded_delta", "Center: guarded", "#277F8E", "x"),
-                                          ("lo_delta", "Lower: guarded", "#C9563D", "v"),
-                                          ("hi_delta", "Upper: guarded", "#8560A5", "^")]:
-            c.scatter(e[KEYS[-1]], e[col], s=15, color=color, marker=marker, label=label)
-        c.set_title("Comparable summary changes"); c.set_ylabel("bps / adjacent event")
+        for col, label, color in [("aggregate_delta_30m", "Original aggregate", "#BBBBBB"),
+                                  ("common_dealer_delta_30m", "Common dealers", "#277F8E"),
+                                  ("center_delta_30m", "Condition guarded", "#8560A5")]:
+            c.plot(f.index, f[col], color=color, label=label, drawstyle="steps-post", lw=1.2)
+        c.set_title("Fixed 30min change: common vs full roster"); c.set_ylabel("bps / 30 minutes")
         finite = e["center"].notna()
         unquoted = int(e.loc[finite, "center_nearest_gap"].gt(1e-9).sum())
         notes = [f"OBSERVED: median is not a quoted candidate at {unquoted}/{int(finite.sum())} events; median candidate gap {e['gap'].median():.2f} bps.",
                  f"CHECK: {int(e['condition_changed'].sum())}/{int((~e['history_break']).sum())} comparable transitions change quantity support or count. Bounds are order statistics, not tracked streams.",
-                 "USE: retain center + lower/upper + gap/count; compare guarded changes. Persistent parallel levels do not establish which one is correct."]
+                 f"USE: common dealers median N={f['n_common_dealers_30m'].median():.1f}; current retention={f['common_retention_30m'].median():.1%}; changed conditions={f['common_condition_changed_fraction_30m'].mean():.1%}. Difference is composition sensitivity, not a causal decomposition. Adjacent-event changes remain in events."]
     elif view == VIEWS[1]:
         tags = sorted(rows["qtag"].unique())
         if len(tags) <= 6:
@@ -341,7 +302,11 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
             selected = rows.loc[rows["qtag"].eq(qtag)]
             a.scatter(selected[KEYS[-1]], selected["s"], s=20, color="#277F8E", label=f"Selected: {qtag}")
         a.set_title("Levels by raw quantity condition (units unknown)")
-        cells, contrasts = quantity_evidence(rows)
+        quantity_key = (dealer, bond, side, day)
+        diagnostics = result.setdefault("quantity_evidence_cache", {})
+        if quantity_key not in diagnostics:
+            diagnostics[quantity_key] = quantity_evidence(rows)
+        cells, contrasts = diagnostics[quantity_key]
         selected_cells = cells.loc[cells["qtag"].eq(qtag)]
         b.scatter(selected_cells[KEYS[-1]], selected_cells["count"], s=20, color="#8560A5")
         b.set_title(f"Spreads per event: {qtag}"); b.set_ylabel("count"); b.set_ylim(bottom=0)
@@ -371,7 +336,8 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
         b.set_ylim(0, max(1, max_age * 1.05) if pd.notna(max_age) else 1)
         for col, label, color, style in [("n_dealers", "Complete", "#555555", "-"),
                                          ("n_fresh_dealers", f"Within {age_min}m", "#C9563D", "-"),
-                                         ("decay_effective_dealers", "Decay effective N", "#277F8E", "--")]:
+                                         ("decay_effective_dealers", "Decay effective N", "#277F8E", "--"),
+                                         ("n_common_dealers_30m", "Common with t-30min", "#8560A5", ":")]:
             c.plot(f.index, f[col], color=color, label=label, ls=style, drawstyle="steps-post")
         c.set_title("Coverage and weight concentration"); c.set_ylabel("dealers / effective N")
         c.yaxis.set_major_locator(MaxNLocator(integer=True)); c.set_ylim(bottom=0)
@@ -443,21 +409,29 @@ def research_figure(result, dealer, bond, side, day, view, qtag, age_min, canvas
 # %% [markdown]
 # ## Controls and outputs
 # Representative cases lead the issuer list; all issuers remain selectable.
-# Default dealer/bond/day order favours multi-spread support, then event count.
+# Bond/side/day selectors favour multi-spread support, then event count.
+# Apply combines selector changes. Display dealer, quantity and layout reuse the applied state.
+# Freeze fixed cases selects random / typical / measured impact cases from three local probes per observed unit.
 # Default All four is one 2x2 dashboard. Detail layouts preserve the case; Save all 4 PNG always exports all sections.
 # Changing layout preserves the case. Quantity can be selected from every observed raw condition.
 # The Age setting is both the decay half-life and the max-age hypothesis; for Influence it limits peer age.
 # `step3_result['events']`: event-time median, gap, condition flags, guarded delta and observed changes in (t-30m, t].
-# `step3_features`: same-day as-of levels, coverage, ages, ambiguity and guarded fixed-30min aggregate changes.
+# `step3_features`: same-day levels, coverage, ages, ambiguity, guarded change and common-dealer fixed-30min diagnostics.
 # The fixed-horizon change is missing when dealer roster / quantity support / candidate count differs at the endpoints.
+# Common-dealer change remains observable after a condition change, with N, retention and changed-condition fraction.
+# Its difference from the original aggregate is a composition sensitivity check, not a causal decomposition.
 # Unknown change age stays NaN. Absent or incomplete current quotes do not fall back to a previous valid quote.
 # Full-day plots / case rankings are retrospective displays; neither is a feature or a claim of predictive success.
 
 # %% 3. Choose a case; compare rules; save one PNG
 if "step3_controls" in globals():
     for control in step3_controls:
-        control.unobserve(refresh_step3, names="value")
+        control.unobserve_all("value")
     step3_save.on_click(save_step3, remove=True)
+    if "step3_apply" in globals():
+        step3_apply.on_click(refresh_step3, remove=True)
+    if "step3_freeze" in globals():
+        step3_freeze.on_click(freeze_step3_cases, remove=True)
     step3_dashboard.close()
 step3_issuer = widgets.Dropdown(options=issuer_choices(), description="Issuer:", layout=widgets.Layout(width="850px"))
 step3_view = widgets.Dropdown(options=[ALL_VIEWS] + VIEWS, value=ALL_VIEWS, description="Layout:")
@@ -465,10 +439,85 @@ step3_dealer = widgets.Dropdown(description="Dealer:", layout=widgets.Layout(wid
 step3_bond, step3_side, step3_day = widgets.Dropdown(description="Bond:"), widgets.Dropdown(description="Side:"), widgets.Dropdown(description="ET day:")
 step3_quantity = widgets.Dropdown(description="Quantity:", layout=widgets.Layout(width="340px"))
 step3_age = widgets.Dropdown(options=[10, 30, 60], value=DEFAULT_AGE_MIN, description="Age (min):")
-step3_save = widgets.Button(description="Save all 4 PNG", icon="download")
-step3_status = widgets.HTML()
+step3_apply = widgets.Button(description="Apply / Refresh", icon="refresh")
+step3_freeze = widgets.Button(description="Freeze fixed cases", icon="list")
+step3_case = widgets.Dropdown(options=[("Issuer drilldown", None)], description="Case:", layout=widgets.Layout(width="1000px"))
+step3_save = widgets.Button(description="Save all 4 PNG", icon="download", disabled=True)
+step3_status, step3_case_status = widgets.HTML(), widgets.HTML()
 step3_image = widgets.Image(format="png", layout=widgets.Layout(width="100%", max_width="1500px"))
-step3_result, step3_features, step3_figure, step3_busy, step3_cache_key = None, None, None, False, None
+step3_result, step3_features, step3_figure, step3_busy, step3_cache_key = None, pd.DataFrame(), None, False, None
+
+
+def step3_key():
+    return (step3_issuer.value, step3_bond.value, step3_side.value, step3_day.value, step3_age.value)
+
+
+def step3_issuer_result():
+    global step3_result
+    if step3_result is None or step3_result["issuer"] != step3_issuer.value:
+        labels = step3_prepared["events"].cusip.map(cusip_issuer).astype("string").fillna("[Missing issuer]")
+        raw = step3_raw.loc[issuer_labels.eq(step3_issuer.value)]
+        valid = raw[KEYS].notna().all(axis=1)
+        for key in SERIES:
+            valid &= raw[key].astype("string").str.strip().ne("").fillna(False)
+        step3_result = dict(raw=raw, events=step3_prepared["events"].loc[labels.eq(step3_issuer.value)],
+                            unkeyed=int((~valid).sum()), issuer=step3_issuer.value, quantity_evidence_cache={})
+
+
+def sync_step3_selectors(reset=False):
+    """Cheap event-table navigation; never constructs events or as-of features."""
+    step3_issuer_result()
+    eligible = step3_result["events"].assign(multi=lambda x: x.candidate_count.gt(1))
+    # Select the bond/side/day first, so changing display dealer cannot change
+    # the query universe or force another as-of calculation.
+    for box, column in [(step3_bond, "cusip"), (step3_side, "side"), (step3_day, "day"), (step3_dealer, "firm")]:
+        ranked = eligible.groupby(column, observed=True)["multi"].agg(["sum", "size"]).sort_values(["sum", "size"], ascending=False, kind="stable")
+        old, options = box.value, list(ranked.index)
+        box.options = [(f"{v:%Y-%m-%d}" if column == "day" else str(v), v) for v in options]
+        box.value = old if not reset and old in options else (options[0] if options else None)
+        eligible = eligible.loc[eligible[column].eq(box.value)]
+    raw = step3_result["raw"]
+    if len(eligible):
+        own = raw.loc[raw.firm.eq(step3_dealer.value) & raw.cusip.eq(step3_bond.value) & raw.side.eq(step3_side.value) & raw[KEYS[-1]].dt.normalize().eq(step3_day.value)]
+        tags = own.qtag.value_counts().index.tolist()
+        options = [t for t in tags if t.startswith("q=")] + [t for t in tags if not t.startswith("q=")]
+        old = step3_quantity.value
+        step3_quantity.options = options
+        step3_quantity.value = old if old in options and not reset else (options[0] if options else None)
+    else:
+        step3_quantity.options = []
+    return eligible
+
+
+def draw_step3():
+    global step3_figure, step3_features
+    step3_quantity.layout.display = "" if step3_view.value in [ALL_VIEWS, VIEWS[1]] else "none"
+    step3_age.layout.display = "" if step3_view.value in [ALL_VIEWS] + VIEWS[2:] else "none"
+    if step3_key() != step3_cache_key or step3_result is None or "features" not in step3_result:
+        step3_features = pd.DataFrame()
+        step3_image.value = b""
+        step3_save.disabled = True
+        step3_status.value = "Selection pending. Set bond / side / ET day / age, then Apply / Refresh. Dealer, quantity and layout only redraw an applied case."
+        return
+    step3_features = step3_result["features"].assign(cusip=step3_bond.value, side=step3_side.value)
+    step3_figure = research_figure(step3_result, step3_dealer.value, step3_bond.value, step3_side.value, step3_day.value, step3_view.value, step3_quantity.value, step3_age.value)
+    with BytesIO() as buffer:
+        step3_figure.savefig(buffer, format="png", dpi=110, facecolor="white")
+        step3_image.value = buffer.getvalue()
+    step3_save.disabled = False
+    step3_status.value = f"Shared event table; cached bond/side/day state. As-of + detail calculation {step3_result['asof_seconds']:.3f}s. All four sections save together; raw source stays in bcq_df."
+
+
+def selection_changed_step3(change=None):
+    global step3_busy
+    if step3_busy:
+        return
+    step3_busy = True
+    try:
+        sync_step3_selectors(reset=change is not None and change["owner"] is step3_issuer)
+        draw_step3()
+    finally:
+        step3_busy = False
 
 
 def refresh_step3(change=None):
@@ -476,73 +525,102 @@ def refresh_step3(change=None):
     if step3_busy:
         return
     step3_busy = True
+    step3_apply.disabled, step3_save.disabled = True, True
+    step3_image.value = b""
     try:
-        step3_status.value = "Building the selected research case..."
-        if step3_result is None or step3_result["issuer"] != step3_issuer.value:
-            raw = bcq_df.loc[issuer_labels.eq(step3_issuer.value)].copy()
-            step3_result = event_history(raw)
-            step3_result["issuer"] = step3_issuer.value
-            step3_cache_key = None
-        eligible = step3_result["events"].copy()
-        eligible["multi"] = eligible["candidate_count"].gt(1)
-        reset = change is not None and change["owner"] is step3_issuer
-        for box, column in [(step3_dealer, "firm"), (step3_bond, "cusip"), (step3_side, "side"), (step3_day, "day")]:
-            ranked = eligible.groupby(column, observed=True)["multi"].agg(["sum", "size"]).sort_values(["sum", "size"], ascending=False, kind="stable")
-            old = box.value
-            options = list(ranked.index)
-            box.options = [(f"{v:%Y-%m-%d}" if column == "day" else str(v), v) for v in options]
-            box.value = old if not reset and old in options else (options[0] if options else None)
-            reset |= change is not None and change["owner"] is box
-            eligible = eligible.loc[eligible[column].eq(box.value)]
-        step3_quantity.layout.display = "" if step3_view.value in [ALL_VIEWS, VIEWS[1]] else "none"
-        step3_age.layout.display = "" if step3_view.value in [ALL_VIEWS] + VIEWS[2:] else "none"
+        eligible = sync_step3_selectors()
         if eligible.empty:
             step3_features = pd.DataFrame()
             step3_figure = Figure(figsize=(12, 5), facecolor="white")
             ax = step3_figure.subplots(); ax.axis("off")
-            ax.text(0.5, 0.5, f"No keyed events for this selection.\nUnkeyed rows: {step3_result['unkeyed']:,}", ha="center", va="center")
-        else:
-            raw = step3_result["raw"]
-            case = raw.loc[raw["firm"].eq(step3_dealer.value) & raw["cusip"].eq(step3_bond.value) & raw["side"].eq(step3_side.value) & raw[KEYS[-1]].dt.normalize().eq(step3_day.value)]
-            tags = case["qtag"].value_counts().index.tolist()
-            positive_tags = [t for t in tags if t.startswith("q=")]
-            options = positive_tags + [t for t in tags if t not in positive_tags]
-            old = step3_quantity.value
-            step3_quantity.options = options
-            step3_quantity.value = old if old in options and not reset else options[0]
-            key = (step3_issuer.value, step3_bond.value, step3_side.value, step3_day.value, step3_age.value)
-            if key != step3_cache_key:
-                e = step3_result["events"]
-                history = e.loc[e["cusip"].eq(step3_bond.value) & e["side"].eq(step3_side.value)]
-                today = history.loc[history["day"].eq(step3_day.value), KEYS[-1]]
-                times = pd.date_range(today.min().ceil(GRID), today.max().floor(GRID), freq=GRID).union(pd.DatetimeIndex([today.min(), today.max()]))
-                slots, features = asof_features(history, times, step3_age.value)
-                step3_result.update(slots=slots, features=features)
-                step3_cache_key = key
-            step3_features = step3_result["features"].assign(cusip=step3_bond.value, side=step3_side.value)
-            step3_figure = research_figure(step3_result, step3_dealer.value, step3_bond.value, step3_side.value, step3_day.value, step3_view.value, step3_quantity.value, step3_age.value)
-        with BytesIO() as buffer:
-            step3_figure.savefig(buffer, format="png", dpi=110, facecolor="white")
-            step3_image.value = buffer.getvalue()
-        step3_status.value = "All four sections share this case. Save all 4 PNG exports one image. Raw records and draft features stay in step3_result / step3_features."
+            ax.text(.5, .5, f"No keyed events for this selection.\nUnkeyed rows: {step3_result['unkeyed']:,}", ha="center", va="center")
+            with BytesIO() as buffer:
+                step3_figure.savefig(buffer, format="png", dpi=110)
+                step3_image.value = buffer.getvalue()
+            step3_status.value = "No keyed events; no numeric aggregation was run."
+            return
+        key = step3_key()
+        if key not in step3_case_cache:
+            step3_status.value = "Building this bond / side / ET day state once..."
+            started = perf_counter()
+            e = step3_result["events"]
+            history = e.loc[e.cusip.eq(step3_bond.value) & e.side.eq(step3_side.value) & e.day.eq(step3_day.value)]
+            today = history[KEYS[-1]]
+            times = pd.date_range(today.min().ceil(GRID), today.max().floor(GRID), freq=GRID).union(pd.DatetimeIndex([today.min(), today.max()]))
+            slots, features = asof_features(history, times, step3_age.value)
+            step3_case_cache[key] = dict(slots=slots, features=features, asof_seconds=perf_counter() - started)
+        step3_result.update(step3_case_cache[key])
+        step3_cache_key = key
+        draw_step3()
     finally:
+        step3_apply.disabled = False
         step3_busy = False
 
 
+def freeze_step3_cases(_=None):
+    global step3_population, step3_manifest, step3_busy
+    if step3_busy:
+        return
+    step3_busy = True
+    step3_freeze.disabled = True
+    try:
+        from quote_quality_population import population_tables, fixed_case_manifest, case_options
+        step3_case_status.value = "Freezing cases from observed bond/side/days; three local rule probes per unit..."
+        if step3_population is None:
+            step3_population = population_tables(data_ig, bcq_df, event_cache=step3_prepared)
+        if step3_manifest is None:
+            step3_manifest = fixed_case_manifest(step3_population)
+        step3_case.options = [("Issuer drilldown", None)] + case_options(step3_manifest)
+        counts = step3_manifest.selection.value_counts()
+        impacts = step3_population["impact_table"]
+        step3_case_status.value = (f"Fixed cases: random {int(counts.get('Random', 0))}, typical {int(counts.get('Typical', 0))}, measured high impact {int(counts.get('High impact', 0))}. "
+                                  f"Impact selection used {len(impacts):,} observed bond/side/days and {int(impacts.impact_queries.sum()):,} first/middle/last local queries. Cases and probes do not estimate full-day or market occurrence rates.")
+    finally:
+        step3_freeze.disabled = False
+        step3_busy = False
+
+
+def choose_fixed_step3(change=None):
+    global step3_busy
+    if step3_busy or step3_case.value is None:
+        return
+    row = step3_manifest.loc[step3_manifest.case_id.eq(step3_case.value)].iloc[0]
+    step3_busy = True
+    try:
+        source_issuer = bcq_df.loc[bcq_df.cusip.eq(row.cusip), "ISSUER"].astype("string").fillna("[Missing issuer]").iloc[0]
+        step3_issuer.value = source_issuer
+        sync_step3_selectors(reset=True)
+        for box, value in [(step3_bond, row.cusip), (step3_side, row.side), (step3_day, row.day), (step3_dealer, row.firm)]:
+            if value not in [v for _, v in box.options]:
+                raise ValueError("Fixed case is absent from this loaded issuer selection")
+            box.value = value
+            sync_step3_selectors()
+    finally:
+        step3_busy = False
+    refresh_step3()
+
+
 def save_step3(change=None):
-    folder = Path("outputs/quote_quality_step3")
-    folder.mkdir(parents=True, exist_ok=True)
+    if step3_busy or step3_save.disabled or step3_key() != step3_cache_key:
+        return
+    folder = Path("outputs/quote_quality_step3"); folder.mkdir(parents=True, exist_ok=True)
     name = "_".join(str(v) for v in [step3_issuer.value, step3_bond.value, step3_dealer.value, step3_side.value, step3_day.value, ALL_VIEWS, step3_quantity.value, step3_age.value])
     name = "".join(c if c.isalnum() else "_" for c in name)[:220]
     path = folder / f"{name}.png"
-    export = research_figure(step3_result, step3_dealer.value, step3_bond.value, step3_side.value, step3_day.value, ALL_VIEWS, step3_quantity.value, step3_age.value) if not step3_features.empty else step3_figure
+    export = research_figure(step3_result, step3_dealer.value, step3_bond.value, step3_side.value, step3_day.value, ALL_VIEWS, step3_quantity.value, step3_age.value)
     export.savefig(path, dpi=180, facecolor="white")
     step3_status.value = f"Saved: {path}"
 
-step3_controls = [step3_issuer, step3_view, step3_dealer, step3_bond, step3_side, step3_day, step3_quantity, step3_age]
-for box in step3_controls:
-    box.observe(refresh_step3, names="value")
+step3_controls = [step3_issuer, step3_view, step3_dealer, step3_bond, step3_side, step3_day, step3_quantity, step3_age, step3_case]
+for box in [step3_issuer, step3_dealer, step3_bond, step3_side, step3_day, step3_age]:
+    box.observe(selection_changed_step3, names="value")
+for box in [step3_view, step3_quantity]:
+    box.observe(selection_changed_step3, names="value")
+step3_case.observe(choose_fixed_step3, names="value")
+step3_apply.on_click(refresh_step3)
+step3_freeze.on_click(freeze_step3_cases)
 step3_save.on_click(save_step3)
-step3_dashboard = widgets.VBox([step3_issuer, step3_view, widgets.HBox([step3_dealer, step3_bond, step3_side]), widgets.HBox([step3_day, step3_quantity, step3_age, step3_save]), step3_status, step3_image])
+step3_dashboard = widgets.VBox([step3_issuer, widgets.HBox([step3_freeze, step3_apply]), step3_case, step3_case_status, step3_view,
+                               widgets.HBox([step3_bond, step3_side, step3_day]), widgets.HBox([step3_dealer, step3_quantity, step3_age, step3_save]), step3_status, step3_image])
 display(step3_dashboard)
 refresh_step3()

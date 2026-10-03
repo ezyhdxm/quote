@@ -10,6 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from quote_quality_core import prepare_quote_events
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "quote_quality_step2.py"
@@ -48,7 +49,7 @@ def fixture():
     return quotes, trades
 
 
-def load_dashboard(quotes=None, trades=None):
+def load_dashboard(quotes=None, trades=None, issuer="Alpha"):
     default_quotes, default_trades = fixture()
     quotes = default_quotes if quotes is None else quotes
     trades = default_trades if trades is None else trades
@@ -59,8 +60,12 @@ def load_dashboard(quotes=None, trades=None):
     state = {"__name__": "step2_test"}
     with contextlib.redirect_stdout(io.StringIO()), patch("pandas.read_parquet", side_effect=read), \
             patch.object(Path, "exists", return_value=True), \
+            patch("quote_quality_cache.prepare_quote_events", side_effect=prepare_quote_events), \
             patch("IPython.display.display") as show, patch("IPython.display.clear_output"):
         exec(compile(SCRIPT.read_text(), str(SCRIPT), "exec"), state)
+        if issuer is not None and issuer in [value for _, value in state["issuer_box"].options]:
+            state["issuer_box"].value = issuer
+            state["change_issuer"]()
     return state, show
 
 
@@ -122,7 +127,7 @@ class MultiSpreadChecks(unittest.TestCase):
         self.assertEqual(event["qclass"], "Different positive")
         state["case_type"].value = "Incomplete spread"
         self.assertGreater(state["step2_result"]["groups"].loc[state["event_box"].value, "bad_spreads"], 0)
-        state["case_type"].value = "Single-spread control"
+        state["case_type"].value = "Single-spread observation"
         self.assertTrue(all(state["step2_result"]["groups"].loc[i, "bad_spreads"] == 0 for _, i in state["event_box"].options))
         state["issuer_box"].value = "Beta"
         state["case_type"].value = "All multi-spread"
@@ -164,7 +169,7 @@ class MultiSpreadChecks(unittest.TestCase):
     def test_event_pages_expose_all_controls_and_issuer_switch_resets(self):
         state, _ = load_dashboard()
         state["view_box"].value = "Case"
-        state["case_type"].value = "Single-spread control"
+        state["case_type"].value = "Single-spread observation"
         state["dealer_box"].value = "B"
         first = {i for _, i in state["event_box"].options}
         self.assertEqual(len(first), 50)
@@ -190,7 +195,7 @@ class MultiSpreadChecks(unittest.TestCase):
         state, _ = load_dashboard(q, trades)
         g = state["step2_result"]["groups"]
         self.assertEqual(len(g), 5)
-        first = g.iloc[0]
+        first = g.loc[g["side"].eq("bid") & g["quote_timestamp_ET"].eq(pd.Timestamp("2026-03-02T15:00:00Z").tz_convert("America/New_York"))].iloc[0]
         self.assertEqual(first["qclass"], "Different positive")
         self.assertFalse(first["multi"])
         incomplete = g.loc[g["bad_spreads"].gt(0)].iloc[0]
@@ -276,20 +281,15 @@ class MultiSpreadChecks(unittest.TestCase):
         trades["EFFECTIVE_DATETIME_TS"] = pd.Timestamp("2026-01-02")
         state, _ = load_dashboard(quotes, trades)
         options = state["issuer_box"].options
-        first = options[:7]
-        self.assertEqual([name for label, name in first], [
-            "Z Broad", "Z Wide", "Z Different", "Z Zero", "Z Same", "Z Unknown", "Z Control",
-        ])
         self.assertEqual(len(options), 1708)
         self.assertEqual(len({name for label, name in options}), 1708)
-        self.assertEqual(state["issuer_box"].value, "Z Broad")
-        for label, name in first:
-            self.assertIn("multi=", label)
-            self.assertIn("[", label)
+        self.assertEqual([name for _, name in options], sorted(name for _, name in options))
+        # Research cases are now a separate frozen manifest; issuer navigation
+        # no longer sorts the population only by unusual multi-spread examples.
         summary = state["issuer_summary"]
-        self.assertTrue(pd.isna(summary.loc["Z Incomplete", "front_reason"]))
-        self.assertTrue(pd.isna(summary.loc["A tiny 0000", "front_reason"]))
-        self.assertEqual(summary.loc["Z Different", "different_multi"], 20)
+        self.assertEqual(summary.loc["Z Different", "multi_events"], 20)
+        self.assertIn("A tiny 0000", summary.index)
+        self.assertIn("Z Incomplete", summary.index)
         # Exact repeated rows cannot improve a group's rank or support count.
         state["bcq_df"] = pd.concat([state["bcq_df"], state["bcq_df"].iloc[[0]]], ignore_index=True)
         state["issuer_labels"] = state["bcq_df"]["ISSUER"].astype("string").fillna("[Missing issuer]")
@@ -299,7 +299,7 @@ class MultiSpreadChecks(unittest.TestCase):
 
     def test_ranking_fallback_is_labelled_and_matches_selected_issuer_statistics(self):
         state, _ = load_dashboard()
-        self.assertIn("limited sample", state["issuer_box"].options[0][0])
+        self.assertEqual(state["issuer_box"].options[0], ("Alpha", "Alpha"))
         summary = state["issuer_summary"]
         for issuer in ["Alpha", "Beta", "Gamma"]:
             result = state["analyze_issuer"](issuer)

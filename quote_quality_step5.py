@@ -52,6 +52,7 @@ bcq_df["ISSUER"] = bcq_df["cusip"].map(cusip_issuer)
 
 from quote_quality_core import (BASE_FEATURES, BASE_CAT_FEATURES, build_quote_features,
     chronological_split, run_comparison, representative_issuers, model_versions)
+from quote_quality_cache import prepare_quote_events
 
 # %% [markdown]
 # ## Same prediction task, finite quote alternatives
@@ -185,6 +186,7 @@ step5_detail=widgets.HTML();step5_elapsed=widgets.HTML()
 step5_clock_stop=Event()
 step5_progress_state={'last_update':0.,'context':''}
 step5_frame=None;step5_predictions=None;step5_test_predictions=None;step5_locked=None;step5_busy=False
+step5_event_cache=None
 
 
 def report_step5(stage,completed=None,total=None,detail=''):
@@ -217,7 +219,7 @@ def step5_clock(stop,started,widget):
 
 
 def run_step5(action='preview'):
-    global step5_frame,step5_predictions,step5_test_predictions,step5_locked,step5_figure,step5_busy,step5_clock_stop
+    global step5_frame,step5_predictions,step5_test_predictions,step5_locked,step5_figure,step5_busy,step5_clock_stop,step5_event_cache
     if step5_busy:return
     step5_busy=True
     for button in [step5_preview,step5_build,step5_validate,step5_test,step5_export,step5_save]:button.disabled=True
@@ -240,7 +242,9 @@ def run_step5(action='preview'):
             step5_figure=validation_figure(shown,title=step5_issuer.value)
         else:
             if step5_frame is None:
-                features=build_quote_features(bcq_df,model_data[['row_id','cusip','time']],AGE_MIN,SYNC_MIN,ALLOW_EXACT_QUOTES,progress=report_step5)
+                if step5_event_cache is None:
+                    step5_event_cache=prepare_quote_events(bcq_df,progress=report_step5)
+                features=build_quote_features(bcq_df,model_data[['row_id','cusip','time']],AGE_MIN,SYNC_MIN,ALLOW_EXACT_QUOTES,progress=report_step5,event_cache=step5_event_cache)
                 step5_frame=model_data.merge(features.drop(columns=['cusip','time']),on='row_id',validate='one_to_one')
             else:
                 n_bonds=step5_frame.cusip.nunique()
@@ -300,7 +304,14 @@ def export_step5(_=None):
         age_min=AGE_MIN,sync_min=SYNC_MIN,lgb_params=LGB_PARAMS,locked_choice=step5_locked,
         val_days=VALIDATION_DAYS,test_days=TEST_DAYS,embargo_days=EMBARGO_DAYS,
         model_columns={name:columns for name,(columns,_) in specs.items()},
+        validation_available=step5_predictions is not None,
+        quote_file_dates=[bcq_df.quote_timestamp_ET.min().isoformat(),bcq_df.quote_timestamp_ET.max().isoformat()],
+        event_cache_key=step5_event_cache.get('cache_key') if step5_event_cache is not None else None,
         split_dates={label:sorted(group.time.dt.strftime('%Y-%m-%d').unique()) for label,group in step5_frame.groupby('split')})
+    import hashlib
+    saved_validation_files=['model_features.parquet']+(['validation_predictions.parquet'] if step5_predictions is not None else [])
+    manifest['validation_files_sha256']={name:hashlib.sha256((folder/name).read_bytes()).hexdigest()
+        for name in saved_validation_files}
     (folder/'experiment.json').write_text(json.dumps(manifest,indent=2))
     step5_status.value=f'Saved features, experiment settings and available predictions to {folder}'
 

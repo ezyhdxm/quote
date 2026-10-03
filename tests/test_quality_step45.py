@@ -193,7 +193,11 @@ class NotebookChecks(unittest.TestCase):
         self.assertEqual(len(s['step4_figure'].axes),6)
         s['step4_age'].value=10;s['step4_sync'].value=0
         self.assertEqual(s['step4_image'].model_id,identity)
+        self.assertEqual(bytes(s['step4_image'].value),b'')
+        self.assertTrue(s['step4_save'].disabled)
+        s['apply_step4']()
         self.assertTrue(bytes(s['step4_image'].value).startswith(b'\x89PNG'))
+        self.assertEqual((s['step4_result']['age'],s['step4_result']['sync']),(10,0))
         cell=(ROOT/'quote_quality_step4.py').read_text().split('# %% 3. Case controls')[1]
         old=s['step4_controls'][0];old_refresh=s['refresh_step4']
         with patch('IPython.display.display'),contextlib.redirect_stdout(io.StringIO()):exec(cell,s)

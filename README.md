@@ -1,3 +1,43 @@
+# First population iteration
+
+Step1/2 open at **Global**, with **SECTOR**, **Dealer** and **Issuer** scopes;
+Apply commits a scope change. The three-month traded-bond universe remains the
+coverage denominator, including bonds without quotes. Trade-day support excludes
+history outside the quote-file dates and reports that history separately.
+Descriptive CUSIP sectors use a unique nonempty value, otherwise Unknown or
+Conflicting. Issuer/dealer equal-weight rates and event counts remain separate.
+
+Use **Freeze 18 cases** once in Step2/3/4. Cases are stable with seed 2026:
+6 constrained random, 6 near-stratum typical, up to 6 measured high-impact cases.
+If support is insufficient the interface states the smaller count. Default
+impact probes use first/middle/last observed timestamps per bond/side/day; they
+are local diagnostics, not full-day or population-rate estimates. Actual trade
+query impacts from `trade_rule_review['impacts']` can be passed explicitly to
+`fixed_case_manifest`. The mixed case sample never estimates occurrence rates.
+
+Step3 preserves its prior numerical summaries and adds common-dealer 30-minute
+changes, aggregate changes, endpoint retention and condition changes. Apply
+computes once; dealer/quantity/layout changes redraw the applied case. Step4
+reuses all-dealer bond/day state; age/sync derive masks. A is all fresh pairs,
+B is size/time-eligible slots with original candidates, and C is the identical
+B slots with matched positive-quantity candidates. Raw positive and negative
+gap sources are retained, including dealer, side, timestamp, spread and size.
+
+Step1–4 share checked narrow-event Parquet caches under
+`outputs/quote_quality_cache/`. Source content, full-row duplicate semantics,
+core code and cache schema identify the cache; changes or damaged files rebuild
+it. Raw values are preserved, timestamps are not rounded, and no-quote targets
+retain zero counts/NaN values. This is event reuse, not interrupted-model resume.
+Feature and prediction exports remain the durable outputs; automatic partial
+model checkpoint/resume and persistent test-lock restoration remain pending.
+
+Run revised Step1–4 sequentially in a separate research kernel; preserve the
+completed Step5 kernel. All notebooks still have three code cells and complete
+PNG export. Synthetic checks establish implementation equivalence; real timing,
+sector findings and locked-test gains must come from the research data.
+
+---
+
 # Saved validation and SECTOR review
 
 After Step5 finishes, use **Export features** once. Open
@@ -22,6 +62,22 @@ the 14 BASE_FEATURES. Missing sectors stay Unknown; unmatched or unequal model
 cohorts fail before drawing. Date-equal and leave-one-date diagnostics are
 sensitivity checks, not confidence intervals. Keep the locked test unopened
 until the validation choice is final.
+
+The same live kernel can review rule effects at every eligible trade query:
+
+```python
+from quote_quality_saved import show_trade_rule_effects
+trade_rule_review = show_trade_rule_effects(
+    step5_frame, bcq_df.quote_timestamp_ET.min(), bcq_df.quote_timestamp_ET.max()
+)
+```
+
+This exports one six-panel `trade_query_rule_effects.png`. Historical targets
+outside the quote file's ET dates are counted separately. Clip/downweight effects
+without sufficient other-dealer support are unassessed. Different bonds are
+never averaged into a price. This checks feature/cleaning effects, not test loss.
+If this module was imported before updating code, use `importlib.reload` on it
+once; preserve the completed Step5 frame and predictions.
 
 ---
 
@@ -261,12 +317,12 @@ Select **issuer**, then **Overview** or **Case**:
 
 Representative issuers are automatically placed first. The labelled front section
 interleaves broad multi-spread coverage, wide candidate ranges, different / zero /
-same / unknown quantity cases, and active low-multi-spread controls (up to two
+same / unknown quantity cases, and active low-multi-spread observations (up to two
 distinct issuers per theme). Labels show the reason and multi-group count / total
 group count. All remaining issuers follow alphabetically; none are removed.
 
 Defaults require at least 100 keyed groups, two ET dates and two dealers; anomaly
-themes require at least five multi-spread groups. Controls have no incomplete
+themes require at least five multi-spread groups. These low-multi-spread groups have no incomplete
 spread groups and at most a 1% day-balanced multi-spread rate. If no issuer meets
 the support requirements, the fallback is explicitly labelled **limited sample**.
 These constants are at the start of cell 2. Ranking runs one vectorized pass over
@@ -304,8 +360,8 @@ rows do not count unchanged quotes at later timestamps.
 
 The charts render into one PNG image widget, using unmanaged Matplotlib figures;
 there is no second inline figure display. Rerunning the controls cell detaches
-its old observers. When replacing an older notebook, restart the kernel and run
-all three cells once to clear the old dashboard and its saved outputs.
+its old observers. Run revised Step 1–4 notebooks sequentially in their own research kernel.
+Preserve any existing Step5 kernel and its results; do not restart it for UI updates.
 
 Quantity categories are mutually exclusive: missing/other first, then contains
 zero, then different/same positive values. Units and economic meaning remain

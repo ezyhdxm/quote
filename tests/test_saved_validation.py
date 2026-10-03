@@ -77,5 +77,26 @@ class SavedValidationChecks(unittest.TestCase):
             saved.sector_figure(result).savefig(path)
             self.assertGreater(path.stat().st_size, 1000)
 
+    def test_trade_rule_queries_keep_absence_and_mask_unsupported_fallback(self):
+        import quote_quality_core as core
+        f, _ = fixture()
+        f['cusip'] = 'X'
+        q = pd.DataFrame([dict(cusip='X', firm='A', side='bid', spread=60., quantity=0,
+                               quote_timestamp_ET=f.time.iloc[0])])
+        features = core.build_quote_features(q, f[['row_id', 'cusip', 'time']])
+        f = f.drop(columns=['bcq_has_quote', 'bcq_n_pair', 'bcq_n_size_time_pair']).merge(
+            features.drop(columns=['time', 'cusip']), on='row_id', validate='one_to_one')
+        f['bcq_bid_center_candidate_clip'] += 100  # unsupported fallback must never be scored as assessed
+        result = saved.trade_rule_diagnostics(f, f.time.iloc[0], f.time.iloc[2])
+        self.assertEqual(result['n'] + result['outside_file_date_n'], len(f))
+        self.assertLess(result['n'], len(f))
+        clip = result['effects'].loc[result['effects'].rule.eq('Clip')]
+        self.assertEqual(clip.n.sum(), 0)
+        self.assertTrue(clip.p95.isna().all())
+        self.assertEqual(int(result['summary'].quote_n.sum()), 2)
+        self.assertGreater(int(result['summary'].n.sum()), int(result['summary'].quote_n.sum()))
+        with tempfile.TemporaryDirectory() as temp:
+            saved.trade_rule_figure(result).savefig(Path(temp) / 'rule_effects.png')
+
 
 if __name__ == '__main__': unittest.main()

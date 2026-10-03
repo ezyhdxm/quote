@@ -59,7 +59,8 @@ def sector_diagnostics(frame, predictions, selected='Quote levels'):
         raise ValueError(f'Need saved {selected} and {reference} predictions')
     # Row-level target metadata; no whole-window CUSIP sector mapping here.
     rows['sector'] = rows.SECTOR.astype('string').str.strip().replace('', pd.NA).fillna('Unknown')
-    rows['day'] = pd.to_datetime(rows.time).dt.normalize()
+    from quote_quality_core import to_ny_datetime
+    rows['day'] = to_ny_datetime(rows.time).dt.normalize()
     rows['selected_error'] = wide[selected]
     rows['reference_error'] = wide[reference]
     rows['loss_delta'] = rows.selected_error - rows.reference_error
@@ -136,6 +137,8 @@ def sector_figure(result):
 def load_saved_validation(folder='outputs/quote_quality_step5'):
     folder = Path(folder)
     manifest = json.loads((folder / 'experiment.json').read_text())
+    if manifest.get('validation_available') is False:
+        raise ValueError('This export has no completed validation; any older prediction file is not reusable')
     for filename, expected in manifest.get('validation_files_sha256', {}).items():
         if filename not in ['model_features.parquet', 'validation_predictions.parquet']:
             raise ValueError('Invalid validation manifest filename')
@@ -160,6 +163,117 @@ def show_validation_sectors(frame=None, predictions=None, folder='outputs/quote_
     slug = selected.lower().replace(' ', '_')
     path = output / f'validation_sector_{slug}.png'
     fig.savefig(path, dpi=180)
+    from IPython.display import display, Image
+    display(Image(filename=str(path)))
+    return result
+
+
+def trade_rule_diagnostics(frame, quote_start, quote_end):
+    """Rule effects at actual eligible model target queries, inside file ET dates.
+
+    This reads feature values only. It does not inspect test predictions or losses.
+    Historical target dates outside the quote file are counted separately.
+    """
+    from quote_quality_core import to_ny_datetime
+    day = to_ny_datetime(frame.time).dt.normalize()
+    start, end = to_ny_datetime(pd.Series([quote_start, quote_end])).dt.normalize()
+    if pd.isna(start) or pd.isna(end) or start > end:
+        raise ValueError('Need actual quote file start and end timestamps')
+    inside = day.between(start, end)
+    rows = frame.loc[inside].copy()
+    if rows.empty:
+        raise ValueError('No eligible model targets within the quote file dates')
+    rows['sector'] = rows.SECTOR.astype('string').str.strip().replace('', pd.NA).fillna('Unknown')
+    rows['day'] = day.loc[inside]
+    summary = rows.groupby('sector', observed=True).agg(n=('row_id', 'size'), dates=('day', 'nunique'))
+    effect_rows, impact_rows = [], []
+    for side in ['bid', 'ask']:
+        prefix = 'bcq_' + side + '_'
+        equal = rows[prefix + 'center_equal']
+        available = rows[prefix + 'n_dealers'].gt(0)
+        fresh = rows[prefix + 'n_fresh_dealers'].gt(0)
+        supported = rows[prefix + 'n_peer_supported'].gt(0) & available
+        summary[side + '_covered_n'] = available.groupby(rows.sector).sum()
+        summary[side + '_lost_n'] = (available & ~fresh).groupby(rows.sector).sum()
+        summary[side + '_peer_supported_n'] = supported.groupby(rows.sector).sum()
+        summary[side + '_message_age'] = rows[prefix + 'median_message_age_min'].groupby(rows.sector).median()
+        summary[side + '_change_age'] = rows[prefix + 'median_change_age_min'].groupby(rows.sector).median()
+        summary[side + '_unknown_change_fraction'] = rows[prefix + 'unknown_change_age_fraction'].groupby(rows.sector).mean()
+        local = rows[['cusip', 'day']].copy()
+        local['side'] = side
+        changes = []
+        for label, field in [('Decay', 'center_decay'), ('Max age', 'center_max_age'), ('Clip', 'center_candidate_clip'), ('Downweight', 'center_dealer_downweight')]:
+            delta = (rows[prefix + field] - equal).abs()
+            if label in ['Clip', 'Downweight']:
+                delta = delta.where(supported)  # fallback is unassessed, not zero effect
+            changes.append(delta)
+            for sector, values in delta.groupby(rows.sector):
+                values = values.dropna()
+                effect_rows.append(dict(side=side, rule=label, sector=sector, n=len(values),
+                                        median=values.median(), p95=values.quantile(.95)))
+        local['effect'] = pd.concat(changes, axis=1).max(axis=1)
+        local['covered'] = available.astype(int)
+        local['supported'] = supported.astype(int)
+        local['dealer_slots'] = rows[prefix + 'n_dealers']
+        local['fresh_slots'] = rows[prefix + 'n_fresh_dealers']
+        impacts = local.groupby(['cusip', 'side', 'day'], observed=True).agg(
+            impact_queries=('effect', 'size'), peer_supported_queries=('supported', 'sum'),
+            max_center_effect_bps=('effect', 'max'), mean_center_effect_bps=('effect', 'mean'),
+            baseline_dealer_slots=('dealer_slots', 'sum'), fresh_dealer_slots=('fresh_slots', 'sum')).reset_index()
+        impacts['max_age_lost_slots'] = impacts.baseline_dealer_slots - impacts.fresh_dealer_slots
+        impacts['coverage_loss_fraction'] = (impacts.max_age_lost_slots / impacts.baseline_dealer_slots).where(impacts.baseline_dealer_slots.gt(0))
+        impact_rows.append(impacts)
+    for label, field in [('quote', 'bcq_has_quote'), ('pair', 'bcq_n_pair'), ('size_pair', 'bcq_n_size_time_pair')]:
+        summary[label + '_n'] = rows[field].gt(0).groupby(rows.sector).sum()
+    return dict(summary=summary, effects=pd.DataFrame(effect_rows), impacts=pd.concat(impact_rows, ignore_index=True),
+                n=len(rows), outside_file_date_n=int((~inside).sum()), start=start, end=end)
+
+
+def trade_rule_figure(result):
+    summary = result['summary'].sort_values('n', ascending=False)
+    fig = Figure(figsize=(18, max(12, 7 + len(summary) * .3)), facecolor='white')
+    a, b, c, d, e, f = fig.subplots(2, 3).flat
+    fig.subplots_adjust(left=.12, right=.96, top=.86, bottom=.13, wspace=.6, hspace=.52)
+    fig.suptitle('Global / SECTOR | quote rules at actual eligible trade queries\nFeature diagnostics only; no fitting or test-loss inspection', fontsize=16)
+    fig.text(.5, .9, f"{result['start']:%Y-%m-%d}–{result['end']:%Y-%m-%d} ET file dates | n={result['n']:,} targets | {result['outside_file_date_n']:,} historical targets outside file dates reported separately", ha='center', fontsize=10)
+    totals = summary.sum(numeric_only=True)
+    counts = [totals['n'], totals.quote_n, totals.pair_n, totals.size_pair_n]
+    bars = a.bar(['All targets', 'Any quote', 'Fresh pair', 'Size-time pair'], counts, color=['#BBBBBB', '#277F8E', '#C9563D', '#8560A5'])
+    a.bar_label(bars, fmt='%.0f', fontsize=8); a.tick_params(axis='x', rotation=20)
+    a.set_title('Query coverage; one target row per vote'); a.set_ylabel('Targets; no coverage filtering')
+    names = summary.index; y = np.arange(len(names))
+    b.barh(y, summary.quote_n / summary.n, color='#277F8E')
+    b.set_yticks(y, [f'{name} n={int(summary.loc[name,"n"]):,}' for name in names]); b.invert_yaxis(); b.set_xlim(0, 1.05)
+    b.set_title('Any quote / all sector targets'); b.set_xlabel('Fraction')
+    effects = result['effects']
+    pooled = effects.groupby(['side', 'rule'], sort=False).agg(n=('n', 'sum'), median_sector=('median', 'median'), p95_sector=('p95', 'median'))
+    # Sector medians are explicitly labelled; not a disguised pooled quantile.
+    labels = [f'{side} {rule}\nn={int(r.n):,}' for (side, rule), r in pooled.iterrows()]
+    x = np.arange(len(pooled))
+    c.bar(x - .18, pooled.median_sector, .36, label='Median of sector medians', color='#277F8E')
+    c.bar(x + .18, pooled.p95_sector, .36, label='Median of sector P95', color='#C9563D')
+    c.set_xticks(x, labels, rotation=50, fontsize=7); c.set_ylabel('|rule − equal center| bps'); c.set_title('Effect among comparable targets'); c.legend(fontsize=7)
+    for side, offset, color in [('bid', -.16, '#277F8E'), ('ask', .16, '#C9563D')]:
+        covered = summary[side + '_covered_n']
+        d.barh(y + offset, (summary[side + '_lost_n'] / covered).where(covered.gt(0)), .3, color=color, label=side)
+        f.barh(y + offset, (summary[side + '_peer_supported_n'] / covered).where(covered.gt(0)), .3, color=color, label=side)
+        e.scatter(summary[side + '_message_age'], y + offset, color=color, marker='o', label=side + ' message')
+        e.scatter(summary[side + '_change_age'], y + offset, color=color, marker='x', label=side + ' change')
+    for ax in [d, e, f]:
+        ax.set_yticks(y, names); ax.invert_yaxis(); ax.legend(fontsize=7)
+    d.set_title('Max age loses side / covered side targets'); d.set_xlabel('Fraction; NaN = no baseline coverage')
+    e.set_title('Sector median ages at trade query'); e.set_xlabel('Minutes; unknown change ages excluded')
+    f.set_title('Any supported dealer / side-covered targets'); f.set_xlabel('Unsupported clip/downweight is unassessed')
+    fig.text(.05, .06, 'Decisions: measure cutoff coverage cost; retain age/support/ambiguity before adopting a rule. Paired information remains a supplement to single sides.', fontsize=10)
+    fig.text(.05, .035, 'Each effect uses the same bond, side and target time. No different bonds are averaged into a price. Feature diagnostics do not establish predictive gains.', fontsize=10)
+    return fig
+
+
+def show_trade_rule_effects(frame, quote_start, quote_end, folder='outputs/quote_quality_step5'):
+    result = trade_rule_diagnostics(frame, quote_start, quote_end)
+    path = Path(folder) / 'trade_query_rule_effects.png'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    trade_rule_figure(result).savefig(path, dpi=180)
     from IPython.display import display, Image
     display(Image(filename=str(path)))
     return result
