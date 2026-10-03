@@ -18,8 +18,10 @@ def to_ny_datetime(series):
     return values.dt.tz_convert("America/New_York")
 
 
-def event_history(raw):
-    """Distinct numeric spread / raw-size-condition sets, with prefix-only changes."""
+def event_history(raw, progress=None):
+    """Distinct sets and prefix-only changes; optional progress(stage, done, total, detail)."""
+    if progress is not None:
+        progress('events', None, None, f'Normalizing {len(raw):,} quote rows')
     q = raw.copy()
     valid = q[KEYS].notna().all(axis=1)
     for key in SERIES:
@@ -37,6 +39,8 @@ def event_history(raw):
     q["bad"] = q["s"].isna()
     q["pair"] = list(zip(q["s"].fillna("Nonfinite"), q["qtag"]))
     usable = q.loc[valid]
+    if progress is not None:
+        progress('events', None, None, f'Aggregating {len(usable):,} keyed quote rows')
     g = usable.groupby(KEYS, observed=True, sort=False).agg(
         rows=("s", "size"), repeats=("repeat", "sum"), bad=("bad", "sum"),
         spread_set=("s", lambda v: tuple(sorted(v.dropna().unique()))),
@@ -44,6 +48,8 @@ def event_history(raw):
         pair_set=("pair", lambda v: frozenset(v)),
     ).reset_index().sort_values(SERIES + [KEYS[-1]], kind="stable").reset_index(drop=True)
     g["candidate_count"] = g["spread_set"].map(len)
+    if progress is not None:
+        progress('events', None, None, f'Building history for {len(g):,} events')
     for col, fn in [("lo", min), ("hi", max), ("center", np.median)]:
         g[col] = g["spread_set"].map(lambda v: float(fn(v)) if v else np.nan)
     g["gap"] = g["hi"] - g["lo"]
@@ -73,11 +79,16 @@ def event_history(raw):
     g["change_age_min"] = (g[KEYS[-1]] - g["last_change"]).dt.total_seconds() / 60
     g["change_age_unknown"] = g["last_change"].isna()
     g["changes_30m"] = 0
-    for _, idx in g.groupby(segment).groups.items():
+    segments = g.groupby(segment).groups
+    if progress is not None:
+        progress('events', 0, len(segments), 'Counting changes within history segments')
+    for completed, (_, idx) in enumerate(segments.items(), 1):
         times = g.loc[idx, KEYS[-1]].array.as_unit("ns").asi8
         counts = np.r_[0, g.loc[idx, "spread_changed"].to_numpy().cumsum()]
         left = np.searchsorted(times, times - LOOKBACK_MIN * 60 * 10**9, side="right")
         g.loc[idx, "changes_30m"] = counts[1:] - counts[left]
+        if progress is not None and (completed % max(1, (len(segments) + 99) // 100) == 0 or completed == len(segments)):
+            progress('events', completed, len(segments), f'History segments {completed:,}/{len(segments):,}')
     return {"raw": q, "events": g, "unkeyed": int((~valid).sum())}
 
 
@@ -199,15 +210,20 @@ def pair_features(pairs, times):
     return f
 
 
-def build_quote_features(quotes, queries, age_min=30, sync_min=1, allow_exact=True):
+def build_quote_features(quotes, queries, age_min=30, sync_min=1, allow_exact=True, progress=None):
     """queries: row_id,cusip,time. Preserve every query, including absent quotes and bonds."""
     if queries.row_id.duplicated().any() or queries[['row_id','cusip','time']].isna().any().any():
         raise ValueError('Queries require unique row_id and nonmissing cusip/time')
     output=[]
     grouped=quotes.groupby('cusip',observed=True)
-    for bond,q in queries.groupby('cusip',sort=False,observed=True):
+    query_groups=queries.groupby('cusip',sort=False,observed=True)
+    if progress is not None:
+        progress('features', 0, query_groups.ngroups, f'{len(queries):,} trade queries across {query_groups.ngroups:,} bonds')
+    for completed,(bond,q) in enumerate(query_groups, 1):
+        if progress is not None:
+            progress('features', completed-1, query_groups.ngroups, f'Bond {bond}: {len(q):,} trade queries')
         raw=grouped.get_group(bond) if bond in grouped.groups else quotes.iloc[:0]
-        events=event_history(raw)['events']
+        events=event_history(raw, progress=progress)['events']
         times=pd.DatetimeIndex(q.time).sort_values().unique()
         pieces=[]
         for side in ['bid','ask']:
@@ -219,6 +235,8 @@ def build_quote_features(quotes, queries, age_min=30, sync_min=1, allow_exact=Tr
         f['bcq_has_quote']=(f.bcq_bid_n_dealers.add(f.bcq_ask_n_dealers).gt(0)).astype(float)
         joined=q[['row_id','cusip','time']].merge(f,left_on='time',right_index=True,how='left',validate='many_to_one')
         output.append(joined)
+        if progress is not None:
+            progress('features', completed, query_groups.ngroups, f'Finished bond {bond}: {len(q):,} trade queries')
     return pd.concat(output,ignore_index=True).set_index('row_id').reindex(queries.row_id).reset_index() if output else queries.copy()
 
 
@@ -349,7 +367,7 @@ def chronological_split(frame, quote_end, val_days=5, test_days=5, embargo_days=
     return split,refit
 
 
-def run_comparison(frame, params, stage='Validation', selected=None):
+def run_comparison(frame, params, stage='Validation', selected=None, progress=None):
     """Predict D_BM_SPREAD + PREV_BM_SPREAD; same target rows for every version."""
     import lightgbm as lgb
     if stage not in ['Validation','Test']: raise ValueError('Unknown evaluation stage')
@@ -366,7 +384,9 @@ def run_comparison(frame, params, stage='Validation', selected=None):
     if not x.loc[train,'bcq_has_quote'].gt(0).any() or not x.loc[evaluate,'bcq_has_quote'].gt(0).any():
         raise ValueError('Quote increment is unassessed: training or evaluation has no covered trades. Inspect the split/coverage dashboard.')
     predictions=[]; models={}
-    for name,(columns,replacements) in specs.items():
+    for completed,(name,(columns,replacements)) in enumerate(specs.items()):
+        if progress is not None:
+            progress('models', completed, len(specs), f'Preparing model {completed+1}/{len(specs)}: {name}')
         z=x[columns].copy()
         for col,value in replacements.items(): z[col]=value
         for col in columns:
@@ -375,7 +395,20 @@ def run_comparison(frame, params, stage='Validation', selected=None):
                 z[col]=pd.Categorical(z[col],categories=categories)
             else: z[col]=pd.to_numeric(z[col],errors='coerce').replace([np.inf,-np.inf],np.nan)
         model=lgb.LGBMRegressor(**params)
-        model.fit(z.loc[train],x.loc[train,'D_BM_SPREAD'],categorical_feature=BASE_CAT_FEATURES)
+        fit_kwargs={}
+        if progress is not None:
+            progress('fit', 0, model.n_estimators, f'{name}: training')
+            def report_iteration(env):
+                done=env.iteration-env.begin_iteration+1
+                total=env.end_iteration-env.begin_iteration
+                if done % 10 == 0 or done == total:
+                    progress('fit', done, total, f'{name}: iteration {done:,}/{total:,}')
+            report_iteration.order=20
+            report_iteration.before_iteration=False
+            fit_kwargs['callbacks']=[report_iteration]
+        model.fit(z.loc[train],x.loc[train,'D_BM_SPREAD'],categorical_feature=BASE_CAT_FEATURES,**fit_kwargs)
+        if progress is not None:
+            progress('models', completed, len(specs), f'Predicting {stage.lower()} rows: {name}')
         pred=model.predict(z.loc[evaluate])+x.loc[evaluate,'PREV_BM_SPREAD'].to_numpy()
         out=x.loc[evaluate,['row_id','time','TRADE_TYPE','QUANTITY','bcq_has_quote','bcq_n_pair','bcq_n_size_time_pair']].copy()
         out['model']=name;out['stage']=stage;out['pred_spread']=pred
@@ -383,4 +416,6 @@ def run_comparison(frame, params, stage='Validation', selected=None):
         out['abs_error_bps']=abs(out.error_bps)
         out['train_n']=int(train.sum())
         predictions.append(out); models[name]=model
+        if progress is not None:
+            progress('models', completed+1, len(specs), f'Finished model {completed+1}/{len(specs)}: {name}')
     return pd.concat(predictions,ignore_index=True),models

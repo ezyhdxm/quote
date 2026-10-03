@@ -204,7 +204,16 @@ class NotebookChecks(unittest.TestCase):
         s['LGB_PARAMS'].update(n_estimators=3,num_leaves=4,min_child_samples=2,n_jobs=1)
         s['run_step5']('build');self.assertIsNotNone(s['step5_frame'])
         s['run_step5']('validate');self.assertEqual(s['step5_predictions'].model.nunique(),8)
+        self.assertEqual((s['step5_progress'].value,s['step5_progress'].max),(8,8))
+        self.assertEqual(s['step5_progress'].bar_style,'success')
+        self.assertTrue(s['step5_clock_stop'].is_set())
+        # A failed rerun must stop its timer and allow saving a valid previous result after redraw.
+        with patch.dict(s,run_comparison=lambda *a,**k:(_ for _ in ()).throw(ValueError('synthetic failure'))):
+            s['run_step5']('validate')
+        self.assertTrue(s['step5_save'].disabled)
+        self.assertTrue(s['step5_clock_stop'].is_set())
         s['step5_selected'].value='Candidate clip'
+        self.assertFalse(s['step5_save'].disabled)
         s['run_step5']('test');self.assertEqual(s['step5_locked'],'Candidate clip')
         self.assertTrue(s['step5_selected'].disabled);self.assertTrue(s['step5_validate'].disabled)
         saved=s['step5_test_predictions'].copy();s['run_step5']('test')
@@ -220,6 +229,19 @@ class NotebookChecks(unittest.TestCase):
         old=s['step5_validate'];cell=(ROOT/'quote_quality_step5.py').read_text().split('# %% 3. Research controls')[1]
         with contextlib.redirect_stdout(io.StringIO()):exec(cell,s)
         self.assertFalse(old._click_handlers.callbacks)
+
+    def test_step5_interrupt_stops_timer_and_retains_completed_features(self):
+        s=self.load(5);s['run_step5']('build');built=s['step5_frame']
+        with patch.dict(s,run_comparison=lambda *a,**k:(_ for _ in ()).throw(KeyboardInterrupt())):
+            s['run_step5']('validate')
+        self.assertIs(s['step5_frame'],built)
+        self.assertFalse(s['step5_busy'])
+        self.assertTrue(s['step5_clock_stop'].is_set())
+        self.assertEqual(s['step5_progress'].bar_style,'warning')
+        self.assertIn('Interrupted',s['step5_status'].value)
+        self.assertFalse(s['step5_validate'].disabled)
+        self.assertFalse(s['step5_export'].disabled)
+        self.assertTrue(s['step5_save'].disabled)
 
 
 if __name__=='__main__':unittest.main()

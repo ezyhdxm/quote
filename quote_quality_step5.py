@@ -13,6 +13,9 @@ import matplotlib.dates as mdates
 from matplotlib.ticker import MaxNLocator
 import ipywidgets as widgets
 from IPython.display import display
+from html import escape
+from threading import Event, Thread
+from time import perf_counter
 
 PIPELINE_CSV = Path("data/pipeline/data_pipeline.csv_20260506")
 BENCHMARK_CSV = Path("data/pipeline/DailyCloseUSTBenchmarks.csv_20260506")
@@ -158,9 +161,12 @@ def validation_figure(frame, predictions=None, focus=None, stage='Readiness', ti
 # Build all features writes no file until Export is clicked. Export keeps row_id, original baseline columns and features.
 # Validation reports MAE, day-level differences, coverage/side/size slices and tail errors together.
 # Test refits the locked choice and its comparison baselines on pre-test data. Re-running controls never tunes on test.
+# Progress shows completed bonds/models and current training iterations; elapsed time updates every second.
+# Preprocessing has no reliable percentage. Keep the existing run; progress cannot attach to an older running cell.
 
 # %% 3. Research controls
 if 'step5_dashboard' in globals():
+    if 'step5_clock_stop' in globals():step5_clock_stop.set()
     for button,callback in step5_callbacks:button.on_click(callback,remove=True)
     step5_selected.unobserve(show_step5_choice,names='value')
     step5_dashboard.close()
@@ -173,50 +179,108 @@ step5_selected=widgets.Dropdown(options=['Base'],description='Choice:',disabled=
 step5_export=widgets.Button(description='Export features')
 step5_save=widgets.Button(description='Save all PNG',icon='download',disabled=True)
 step5_status=widgets.HTML();step5_image=widgets.Image(format='png',layout=widgets.Layout(width='100%',max_width='1600px'))
+step5_progress=widgets.IntProgress(description='Bonds:',min=0,max=1,value=0,layout=widgets.Layout(width='650px'))
+step5_rounds=widgets.IntProgress(description='Iterations:',min=0,max=1,value=0,layout=widgets.Layout(width='650px',display='none'))
+step5_detail=widgets.HTML();step5_elapsed=widgets.HTML()
+step5_clock_stop=Event()
+step5_progress_state={'last_update':0.,'context':''}
 step5_frame=None;step5_predictions=None;step5_test_predictions=None;step5_locked=None;step5_busy=False
 
 
+def report_step5(stage,completed=None,total=None,detail=''):
+    # Throttle UI messages, not the calculation or counts. Always show model transitions and completion.
+    now=perf_counter()
+    final=total is not None and completed==total
+    transition=(stage=='features' and step5_progress_state.get('phase')!='features') or (stage=='fit' and step5_rounds.layout.display=='none')
+    if stage in ['features','models']:step5_progress_state['context']=detail
+    if stage!='models' and not final and not transition and now-step5_progress_state['last_update']<.2:return
+    step5_progress_state['last_update']=now
+    if stage in ['features','models']:
+        step5_progress.description='Bonds:' if stage=='features' else 'Models:'
+        step5_progress.max=max(1,int(total or 0));step5_progress.value=int(completed or 0)
+        step5_rounds.layout.display='none'
+        step5_progress_state['phase']=stage
+    elif stage=='fit':
+        step5_rounds.layout.display=''
+        step5_rounds.max=max(1,int(total or 0));step5_rounds.value=int(completed or 0)
+    context=step5_progress_state['context'] if stage=='events' else ''
+    count=f' — {completed:,}/{total:,}' if completed is not None and total is not None else ''
+    step5_detail.value=escape(f'{context} | {detail}' if context else detail)+escape(count)
+
+
+def step5_clock(stop,started,widget):
+    # This timer only updates display text; no training or data work runs in the thread.
+    while not stop.wait(1):
+        seconds=int(perf_counter()-started)
+        widget.value=f'Elapsed: {seconds//3600:02d}:{seconds//60%60:02d}:{seconds%60:02d}'
+
+
 def run_step5(action='preview'):
-    global step5_frame,step5_predictions,step5_test_predictions,step5_locked,step5_figure,step5_busy
+    global step5_frame,step5_predictions,step5_test_predictions,step5_locked,step5_figure,step5_busy,step5_clock_stop
     if step5_busy:return
     step5_busy=True
-    for button in [step5_preview,step5_build,step5_validate,step5_test]:button.disabled=True
+    for button in [step5_preview,step5_build,step5_validate,step5_test,step5_export,step5_save]:button.disabled=True
+    step5_selected.disabled=True;step5_issuer.disabled=True
+    step5_image.value=b''
+    step5_progress.value=0;step5_progress.max=1;step5_progress.bar_style='info'
+    step5_rounds.layout.display='none';step5_rounds.bar_style='info'
+    step5_progress_state.update(last_update=0.,context='',phase='')
+    step5_clock_stop=Event();started=perf_counter();step5_elapsed.value='Elapsed: 00:00:00'
+    clock=Thread(target=step5_clock,args=(step5_clock_stop,started,step5_elapsed),daemon=True);clock.start()
     try:
-        step5_status.value='Computing point-in-time quote features / model comparisons...'
+        step5_status.value='Running. Counts show completed work; bond sizes and model times vary.'
+        report_step5('events',detail='Preparing input rows')
         if action=='preview':
             sample=model_data.loc[model_data.ISSUER.eq(step5_issuer.value)]
             if sample.empty:raise ValueError('No eligible target rows for this issuer through the quote end date. Choose another issuer.')
             q=sample[['row_id','cusip','time']]
-            features=build_quote_features(bcq_df.loc[bcq_df.ISSUER.eq(step5_issuer.value)],q,AGE_MIN,SYNC_MIN,ALLOW_EXACT_QUOTES)
+            features=build_quote_features(bcq_df.loc[bcq_df.ISSUER.eq(step5_issuer.value)],q,AGE_MIN,SYNC_MIN,ALLOW_EXACT_QUOTES,progress=report_step5)
             shown=sample.merge(features.drop(columns=['cusip','time']),on='row_id',validate='one_to_one')
             step5_figure=validation_figure(shown,title=step5_issuer.value)
         else:
             if step5_frame is None:
-                features=build_quote_features(bcq_df,model_data[['row_id','cusip','time']],AGE_MIN,SYNC_MIN,ALLOW_EXACT_QUOTES)
+                features=build_quote_features(bcq_df,model_data[['row_id','cusip','time']],AGE_MIN,SYNC_MIN,ALLOW_EXACT_QUOTES,progress=report_step5)
                 step5_frame=model_data.merge(features.drop(columns=['cusip','time']),on='row_id',validate='one_to_one')
+            else:
+                n_bonds=step5_frame.cusip.nunique()
+                report_step5('features',n_bonds,n_bonds,'Reusing completed in-memory feature frame')
             if action=='validate':
                 if step5_locked is not None:raise ValueError('Test choice is already locked. Start a new experiment explicitly before changing it.')
-                step5_predictions,_=run_comparison(step5_frame,LGB_PARAMS)
+                step5_predictions,_=run_comparison(step5_frame,LGB_PARAMS,progress=report_step5)
                 order=step5_predictions.groupby('model').abs_error_bps.mean().sort_values().index.tolist()
-                step5_selected.options=order;step5_selected.value=order[0];step5_selected.disabled=False
+                step5_selected.options=order;step5_selected.value=order[0]
                 step5_figure=validation_figure(step5_frame,step5_predictions,step5_selected.value,'Validation')
             elif action=='test':
                 if step5_predictions is None:raise ValueError('Run validation before opening the final test')
                 if step5_locked is None:step5_locked=step5_selected.value
                 step5_selected.disabled=True
-                if step5_test_predictions is None:step5_test_predictions,_=run_comparison(step5_frame,LGB_PARAMS,'Test',step5_locked)
+                if step5_test_predictions is None:step5_test_predictions,_=run_comparison(step5_frame,LGB_PARAMS,'Test',step5_locked,progress=report_step5)
                 step5_figure=validation_figure(step5_frame,step5_test_predictions,step5_locked,'Locked test')
             else:step5_figure=validation_figure(step5_frame)
+        step5_detail.value='Rendering the four-panel dashboard...'
         with BytesIO() as buffer:
             step5_figure.savefig(buffer,format='png',dpi=110);step5_image.value=buffer.getvalue()
         step5_save.disabled=False
+        step5_progress.bar_style='success';step5_rounds.bar_style='success'
+        step5_detail.value='Complete. Features and predictions remain in this kernel; use Export features to save.'
         step5_status.value='Finished. All four panels are ready to share; no large tables printed.'
-    except ValueError as error:
-        step5_status.value=str(error)
+    except KeyboardInterrupt:
+        step5_status.value='Interrupted. Any fully built feature frame remains in this kernel; partial model results are not saved.'
+        step5_progress.bar_style='warning';step5_rounds.bar_style='warning'
+    except Exception as error:
+        step5_status.value=escape(f'{type(error).__name__}: {error}')
+        step5_progress.bar_style='danger';step5_rounds.bar_style='danger'
         step5_save.disabled=True
+        if not isinstance(error,ValueError):raise
     finally:
+        step5_clock_stop.set();clock.join(timeout=.2)
+        seconds=int(perf_counter()-started)
+        step5_elapsed.value=f'Elapsed: {seconds//3600:02d}:{seconds//60%60:02d}:{seconds%60:02d}'
         step5_busy=False
         for button in [step5_preview,step5_build]:button.disabled=False
+        step5_issuer.disabled=False
+        step5_export.disabled=step5_frame is None
+        step5_selected.disabled=step5_predictions is None or step5_locked is not None
         step5_validate.disabled=step5_locked is not None
         step5_test.disabled=step5_predictions is None
 
@@ -250,6 +314,7 @@ def show_step5_choice(change=None):
     step5_figure=validation_figure(step5_frame,step5_predictions,step5_selected.value,'Validation')
     with BytesIO() as buffer:
         step5_figure.savefig(buffer,format='png',dpi=110);step5_image.value=buffer.getvalue()
+    step5_save.disabled=False
 
 
 step5_callbacks=[(step5_preview,lambda _:run_step5('preview')),(step5_build,lambda _:run_step5('build')),
@@ -257,6 +322,6 @@ step5_callbacks=[(step5_preview,lambda _:run_step5('preview')),(step5_build,lamb
     (step5_save,save_step5),(step5_export,export_step5)]
 for button,callback in step5_callbacks:button.on_click(callback)
 step5_selected.observe(show_step5_choice,names='value')
-step5_dashboard=widgets.VBox([step5_issuer,widgets.HBox([step5_preview,step5_build,step5_validate]),widgets.HBox([step5_selected,step5_test,step5_export,step5_save]),step5_status,step5_image])
+step5_dashboard=widgets.VBox([step5_issuer,widgets.HBox([step5_preview,step5_build,step5_validate]),widgets.HBox([step5_selected,step5_test,step5_export,step5_save]),step5_status,step5_progress,step5_rounds,step5_detail,step5_elapsed,step5_image])
 display(step5_dashboard)
 run_step5('preview')

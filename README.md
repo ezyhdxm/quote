@@ -35,6 +35,20 @@ The notebook deliberately does not synthesize cross-dealer best bid/ask markets.
 
 ## Step 5: fixed existing target and baseline
 
+During **Run validation**, progress reports completed bonds, the current model
+and completed models (out of eight), and LightGBM iterations within that model.
+Elapsed time updates every second. Event normalization/aggregation and prediction
+are labelled explicitly; counts measure work units, not percent of total runtime.
+The current bond and its query count help identify an unusually expensive bond.
+No additional evaluation or early stopping is used for progress reporting.
+The dashboard clears its old image and disables saving while a run is active.
+Interrupting stops the timer; a fully constructed feature frame remains available
+in the same kernel, but partial model predictions are not checkpointed.
+
+Update both the notebook and `quote_quality_core.py` together before a new run.
+An older running cell cannot acquire these progress controls mid-run. Let it
+finish and export its results before restarting to use the updated code.
+
 The exact **14 BASE_FEATURES** from the supplied training code are required in
 `data_ig`; missing columns raise a clear error. Categorical columns remain
 `PREV_TRADE_TYPE` and `TRADE_TYPE`. Every version predicts `D_BM_SPREAD`, adds
