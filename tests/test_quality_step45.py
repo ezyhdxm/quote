@@ -2,11 +2,13 @@
 import ast
 import contextlib
 import io
+import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import numpy as np
 import pandas as pd
 
@@ -31,7 +33,7 @@ def fixture():
             for minute in range(0,61,5):
                 level=60+dayno*.1+minute*.02+(bond=='Y')*10
                 row={k:1. for k in qc.BASE_FEATURES}
-                row.update(CUSIP=bond,ISSUER='SYNTHETIC '+bond,EFFECTIVE_DATETIME_TS=day+pd.Timedelta(hours=10,minutes=minute),
+                row.update(CUSIP=bond,ISSUER='SYNTHETIC '+bond,SECTOR='Energy' if bond=='X' else 'Utility',EFFECTIVE_DATETIME_TS=day+pd.Timedelta(hours=10,minutes=minute),
                     PREV_BM_SPREAD=level/100,QUANTITY=50_000 if minute%10 else 2_000_000,
                     PREV_TRADE_TYPE='B',TRADE_TYPE='S' if minute%10 else 'B',D_BM_SPREAD=(minute-30)/1000,
                     BM_SPREAD=level/100+(minute-30)/1000)
@@ -181,12 +183,39 @@ class TrainingChecks(unittest.TestCase):
 
 
 class NotebookChecks(unittest.TestCase):
+    VERSIONS=('Base','Quote levels','Reliability','Age decay')
+
+    def setUp(self):
+        # Notebook snapshots and narrow caches must never leak into the checkout.
+        previous=Path.cwd()
+        temporary=tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(os.chdir,previous)
+        os.chdir(temporary.name)
+        self.folder=Path('outputs/quote_quality_step5')
+
     def load(self,step):
         q,t=fixture();state={'__name__':'notebook_check'}
         with contextlib.redirect_stdout(io.StringIO()),patch('pandas.read_parquet',side_effect=lambda path,*a,**k:(t if Path(path).name=='data_ig.parquet' else q).copy()),patch.object(Path,'exists',return_value=True),patch('IPython.display.display') as display:
             exec(compile((ROOT/f'quote_quality_step{step}.py').read_text(),f'step{step}','exec'),state)
         self.assertEqual(display.call_count,1)
         return state
+
+    def configure(self,s):
+        s['LGB_PARAMS'].update(n_estimators=3,num_leaves=4,min_child_samples=2,n_jobs=1)
+
+    def controls_cell(self,step=5):
+        marker='# %% 3. Research controls' if step==5 else '# %% 3. Case controls'
+        return (ROOT/f'quote_quality_step{step}.py').read_text().split(marker,1)[1]
+
+    def checkpoint(self):
+        pointer=json.loads((self.folder/'latest.json').read_text())
+        snapshot=self.folder/pointer['snapshot']
+        return snapshot,json.loads((snapshot/'experiment.json').read_text())
+
+    def rerun_controls(self,s):
+        with patch('IPython.display.display'),contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(self.controls_cell(),'step5_controls','exec'),s)
 
     def test_step4_controls_rerun_and_combined_png(self):
         s=self.load(4);identity=s['step4_image'].model_id
@@ -198,44 +227,246 @@ class NotebookChecks(unittest.TestCase):
         s['apply_step4']()
         self.assertTrue(bytes(s['step4_image'].value).startswith(b'\x89PNG'))
         self.assertEqual((s['step4_result']['age'],s['step4_result']['sync']),(10,0))
-        cell=(ROOT/'quote_quality_step4.py').read_text().split('# %% 3. Case controls')[1]
         old=s['step4_controls'][0];old_refresh=s['refresh_step4']
-        with patch('IPython.display.display'),contextlib.redirect_stdout(io.StringIO()):exec(cell,s)
+        with patch('IPython.display.display'),contextlib.redirect_stdout(io.StringIO()):
+            exec(self.controls_cell(4),s)
         self.assertNotIn(old_refresh,old._trait_notifiers.get('value',{}).get('change',[]))
 
-    def test_step5_build_train_select_lock_export_rerun(self):
-        s=self.load(5);self.assertEqual(len(s['step5_figure'].axes),4)
-        s['LGB_PARAMS'].update(n_estimators=3,num_leaves=4,min_child_samples=2,n_jobs=1)
-        s['run_step5']('build');self.assertIsNotNone(s['step5_frame'])
-        s['run_step5']('validate');self.assertEqual(s['step5_predictions'].model.nunique(),8)
-        self.assertEqual((s['step5_progress'].value,s['step5_progress'].max),(8,8))
-        self.assertEqual(s['step5_progress'].bar_style,'success')
-        self.assertTrue(s['step5_clock_stop'].is_set())
-        # A failed rerun must stop its timer and allow saving a valid previous result after redraw.
-        with patch.dict(s,run_comparison=lambda *a,**k:(_ for _ in ()).throw(ValueError('synthetic failure'))):
+    def test_step5_build_validate_lock_test_are_automatic_checkpoints(self):
+        import quote_quality_saved as saved
+        s=self.load(5);self.configure(s)
+        self.assertEqual(tuple(s['VALIDATION_VERSIONS']),self.VERSIONS)
+        self.assertEqual(len(s['step5_figure'].axes),4)
+        s['run_step5']('build');frame=s['step5_frame']
+        first,metadata=self.checkpoint()
+        self.assertEqual(first,s['step5_last_checkpoint'])
+        self.assertFalse(metadata['validation_available'])
+        self.assertFalse(metadata['test_available'])
+        self.assertIsNone(metadata['locked_choice'])
+        self.assertEqual(metadata['validation_versions'],list(self.VERSIONS))
+        restored=pd.read_parquet(first/'model_features.parquet')
+        pd.testing.assert_frame_equal(restored,frame)
+        self.assertEqual(set(restored.SECTOR),{'Energy','Utility'})
+        original_files={p.name:p.read_bytes() for p in first.iterdir()}
+        real_comparison=s['run_comparison'];models_seen=[];test_started=[]
+        def compare(frame,params,stage='Validation',selected=None,**kwargs):
+            if stage=='Test':
+                # The held-out fit cannot begin until its choice is recoverable.
+                before,manifest=self.checkpoint()
+                self.assertEqual(manifest['locked_choice'],'Age decay')
+                self.assertTrue(manifest['validation_available'])
+                self.assertFalse(manifest['test_available'])
+                self.assertFalse((before/'test_predictions.parquet').exists())
+                self.assertEqual(selected,'Age decay')
+                test_started.append(before)
+            predictions,models=real_comparison(frame,params,stage,selected,**kwargs)
+            models_seen.append(tuple(models))
+            return predictions,models
+        calls=Mock(side_effect=compare)
+        with patch.dict(s,run_comparison=calls):
             s['run_step5']('validate')
-        self.assertTrue(s['step5_save'].disabled)
-        self.assertTrue(s['step5_clock_stop'].is_set())
-        s['step5_selected'].value='Candidate clip'
-        self.assertFalse(s['step5_save'].disabled)
-        s['run_step5']('test');self.assertEqual(s['step5_locked'],'Candidate clip')
-        self.assertTrue(s['step5_selected'].disabled);self.assertTrue(s['step5_validate'].disabled)
-        saved=s['step5_test_predictions'].copy();s['run_step5']('test')
-        pd.testing.assert_frame_equal(saved,s['step5_test_predictions'])
-        with tempfile.TemporaryDirectory() as tmp:
-            actual=Path
-            s['Path']=lambda value:actual(tmp)/value
-            s['export_step5']();s['save_step5']()
-            folder=actual(tmp)/'outputs/quote_quality_step5'
-            self.assertEqual(len(pd.read_parquet(folder/'model_features.parquet')),len(s['step5_frame']))
-            self.assertTrue((folder/'dashboard.png').exists())
-            s['Path']=actual
-        old=s['step5_validate'];cell=(ROOT/'quote_quality_step5.py').read_text().split('# %% 3. Research controls')[1]
-        with contextlib.redirect_stdout(io.StringIO()):exec(cell,s)
-        self.assertFalse(old._click_handlers.callbacks)
+            validation=s['step5_predictions']
+            self.assertEqual(models_seen,[self.VERSIONS])
+            self.assertEqual(validation.model.drop_duplicates().tolist(),list(self.VERSIONS))
+            self.assertEqual(calls.call_args.kwargs['versions'],self.VERSIONS)
+            second,metadata=self.checkpoint()
+            self.assertNotEqual(first,second)
+            self.assertTrue(metadata['validation_available'])
+            self.assertFalse(metadata['test_available'])
+            pd.testing.assert_frame_equal(pd.read_parquet(second/'validation_predictions.parquet'),validation)
+            self.assertEqual((s['step5_progress'].value,s['step5_progress'].max),(4,4))
+            self.assertEqual(s['step5_progress'].bar_style,'success')
+            self.assertTrue(s['step5_clock_stop'].is_set())
+            s['step5_selected'].value='Age decay'
+            s['run_step5']('test');test=s['step5_test_predictions']
+            self.assertEqual(s['step5_locked'],'Age decay')
+            self.assertEqual(models_seen[-1],('Base','Reliability','Age decay'))
+            self.assertEqual(len(test_started),1)
+            self.assertTrue(s['step5_selected'].disabled)
+            self.assertTrue(s['step5_validate'].disabled)
+            final,metadata=self.checkpoint()
+            self.assertNotEqual(final,test_started[0])
+            self.assertTrue(metadata['test_available'])
+            self.assertEqual(metadata['locked_choice'],'Age decay')
+            pd.testing.assert_frame_equal(pd.read_parquet(final/'test_predictions.parquet'),test)
+            pointer=(self.folder/'latest.json').read_bytes()
+            s['run_step5']('test')
+            self.assertIs(s['step5_frame'],frame)
+            self.assertIs(s['step5_predictions'],validation)
+            self.assertIs(s['step5_test_predictions'],test)
+            self.assertEqual(calls.call_count,2)
+            self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
+        self.assertEqual({p.name:p.read_bytes() for p in first.iterdir()},original_files)
+        # Validation recovery reads its own files, even after the locked test exists.
+        real_read=pd.read_parquet
+        with patch('lightgbm.LGBMRegressor.fit',side_effect=AssertionError('viewer must not fit')), \
+                patch('pandas.read_parquet',wraps=real_read) as reads:
+            restored,validation_saved,manifest=saved.load_saved_validation(self.folder)
+        pd.testing.assert_frame_equal(restored,frame)
+        pd.testing.assert_frame_equal(validation_saved,validation)
+        self.assertEqual([Path(call.args[0]).name for call in reads.call_args_list],
+                         ['model_features.parquet','validation_predictions.parquet'])
+        self.assertEqual(manifest['locked_choice'],'Age decay')
+        s['save_step5']();self.assertTrue((self.folder/'dashboard.png').is_file())
+
+    def test_step5_completed_validation_is_reused_without_fit_or_build(self):
+        s=self.load(5);self.configure(s)
+        s['run_step5']('validate')
+        frame,predictions=s['step5_frame'],s['step5_predictions']
+        pointer=(self.folder/'latest.json').read_bytes()
+        with patch.dict(s,run_comparison=Mock(side_effect=AssertionError('do not refit')),
+                         build_quote_features=Mock(side_effect=AssertionError('do not rebuild'))):
+            s['run_step5']('validate')
+            self.assertIs(s['step5_frame'],frame)
+            self.assertIs(s['step5_predictions'],predictions)
+            self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
+            self.assertIn('Completed validation remains',s['step5_status'].value)
+            self.assertFalse(s['step5_save'].disabled)
+
+    def test_step5_controls_rerun_preserves_complete_work_and_locked_choice(self):
+        s=self.load(5);self.configure(s)
+        s['run_step5']('validate');s['step5_selected'].value='Age decay';s['run_step5']('test')
+        frame,predictions,test=s['step5_frame'],s['step5_predictions'],s['step5_test_predictions']
+        cache,metadata,last=s['step5_event_cache'],s['step5_result_metadata'],s['step5_last_checkpoint']
+        old_button=s['step5_validate'];pointer=(self.folder/'latest.json').read_bytes()
+        with patch('lightgbm.LGBMRegressor.fit',side_effect=AssertionError('UI rerun must not fit')), \
+                patch.dict(s,build_quote_features=Mock(side_effect=AssertionError('UI rerun must not rebuild'))):
+            self.rerun_controls(s)
+        self.assertIs(s['step5_frame'],frame)
+        self.assertIs(s['step5_predictions'],predictions)
+        self.assertIs(s['step5_test_predictions'],test)
+        self.assertIs(s['step5_event_cache'],cache)
+        self.assertIs(s['step5_result_metadata'],metadata)
+        self.assertEqual(s['step5_last_checkpoint'],last)
+        self.assertEqual(s['step5_locked'],'Age decay')
+        self.assertEqual(s['step5_selected'].value,'Age decay')
+        self.assertTrue(s['step5_selected'].disabled)
+        self.assertTrue(s['step5_validate'].disabled)
+        self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
+        self.assertFalse(old_button._click_handlers.callbacks)
+
+    def test_step5_controls_rerun_keeps_frame_only_and_validation_only(self):
+        for phase in ['build','validate']:
+            with self.subTest(phase=phase):
+                s=self.load(5);self.configure(s);s['run_step5'](phase)
+                frame,predictions=s['step5_frame'],s['step5_predictions']
+                pointer=(self.folder/'latest.json').read_bytes()
+                with patch('lightgbm.LGBMRegressor.fit',side_effect=AssertionError('UI rebuild must not fit')), \
+                        patch.dict(s,build_quote_features=Mock(side_effect=AssertionError('UI rebuild must not build'))):
+                    self.rerun_controls(s)
+                self.assertIs(s['step5_frame'],frame)
+                self.assertIs(s['step5_predictions'],predictions)
+                self.assertIsNone(s['step5_test_predictions'])
+                self.assertIsNone(s['step5_locked'])
+                self.assertFalse(s['step5_export'].disabled)
+                self.assertEqual(s['step5_validate'].disabled,phase=='validate')
+                self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
+
+    def test_step5_new_kernel_preserves_saved_lock_without_reading_test_or_fit(self):
+        import quote_quality_saved as saved
+        s=self.load(5);self.configure(s)
+        s['run_step5']('validate');s['step5_selected'].value='Age decay';s['run_step5']('test')
+        pointer=(self.folder/'latest.json').read_bytes()
+        final,metadata=self.checkpoint()
+        # The recovered lock comes from metadata, never from held-out predictions.
+        (final/'test_predictions.parquet').write_bytes(b'locked test file must not be read')
+        real_read=pd.read_parquet;real_hash=saved._file_sha256
+        with patch('lightgbm.LGBMRegressor.fit',side_effect=AssertionError('restart must not fit')):
+            restored=self.load(5)
+        self.assertIsNone(restored['step5_frame'])
+        self.assertIsNone(restored['step5_predictions'])
+        self.assertIsNone(restored['step5_test_predictions'])
+        self.assertEqual(restored['step5_locked'],'Age decay')
+        self.assertTrue(restored['step5_saved_lock_guard'])
+        self.assertTrue(restored['step5_selected'].disabled)
+        for name in ['step5_build','step5_validate','step5_test']:self.assertTrue(restored[name].disabled)
+        with patch.dict(restored,run_comparison=Mock(side_effect=AssertionError('persisted lock forbids fit')),
+                        build_quote_features=Mock(side_effect=AssertionError('persisted lock forbids new full build'))):
+            for action in ['build','validate','test']:restored['run_step5'](action)
+        self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
+        with patch('pandas.read_parquet',wraps=real_read) as reads, \
+                patch.object(saved,'_file_sha256',wraps=real_hash) as hashes:
+            frame,predictions,manifest=saved.load_saved_validation(self.folder)
+        self.assertEqual(manifest['locked_choice'],'Age decay')
+        self.assertEqual(set(predictions.model),set(self.VERSIONS))
+        self.assertNotIn('test_predictions.parquet',[Path(call.args[0]).name for call in reads.call_args_list])
+        self.assertNotIn('test_predictions.parquet',[Path(call.args[0]).name for call in hashes.call_args_list])
+        pd.testing.assert_frame_equal(frame,s['step5_frame'])
+
+    def test_step5_controls_rebuild_is_rejected_while_running_without_mutation(self):
+        s=self.load(5)
+        identities={name:s[name] for name in ['step5_dashboard','step5_validate','step5_image',
+                    'step5_progress_state','step5_clock_stop','step5_frame','step5_predictions']}
+        before_image=bytes(s['step5_image'].value)
+        before_status=s['step5_status'].value
+        callbacks=list(s['step5_validate']._click_handlers.callbacks)
+        s['step5_busy']=True
+        with self.assertRaisesRegex(RuntimeError,'Step5 is running'):
+            self.rerun_controls(s)
+        self.assertTrue(s['step5_busy'])
+        for name,value in identities.items():self.assertIs(s[name],value)
+        self.assertEqual(bytes(s['step5_image'].value),before_image)
+        self.assertEqual(s['step5_status'].value,before_status)
+        self.assertEqual(s['step5_validate']._click_handlers.callbacks,callbacks)
+        s['step5_busy']=False
+
+    def test_step5_changed_settings_or_input_reject_fit_and_test_keep_old_results(self):
+        for changed in ['params','input']:
+            with self.subTest(changed=changed):
+                s=self.load(5);self.configure(s);s['run_step5']('build')
+                frame=s['step5_frame'];metadata_before=s['step5_result_metadata']['lgb_params'].copy()
+                original_target=s['model_data'].loc[s['model_data'].index[0],'D_BM_SPREAD']
+                if changed=='params':s['LGB_PARAMS']['n_estimators']+=1
+                else:s['model_data'].loc[s['model_data'].index[0],'D_BM_SPREAD']+=1
+                with patch.dict(s,run_comparison=Mock(side_effect=AssertionError('changed experiment must not fit'))):
+                    s['run_step5']('validate')
+                self.assertIs(s['step5_frame'],frame)
+                self.assertIsNone(s['step5_predictions'])
+                self.assertEqual(s['step5_result_metadata']['lgb_params'],metadata_before)
+                self.assertIn('Inputs or settings changed',s['step5_status'].value)
+                # Reviewable validation remains usable, while an altered experiment
+                # cannot lock/open test or publish another pointer.
+                if changed=='params':s['LGB_PARAMS'].update(metadata_before)
+                else:s['model_data'].loc[s['model_data'].index[0],'D_BM_SPREAD']=original_target
+                s['run_step5']('validate');predictions=s['step5_predictions']
+                self.assertIsNotNone(predictions)
+                pointer=(self.folder/'latest.json').read_bytes()
+                if changed=='params':s['LGB_PARAMS']['n_estimators']+=1
+                else:s['model_data'].loc[s['model_data'].index[0],'D_BM_SPREAD']+=1
+                with patch.dict(s,run_comparison=Mock(side_effect=AssertionError('changed experiment must not open test'))):
+                    s['run_step5']('test')
+                self.assertIs(s['step5_frame'],frame)
+                self.assertIs(s['step5_predictions'],predictions)
+                self.assertIsNone(s['step5_test_predictions'])
+                self.assertIsNone(s['step5_locked'])
+                self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
+                self.assertIn('Inputs or settings changed',s['step5_status'].value)
+
+    def test_step5_validation_checkpoint_failure_keeps_memory_export_retries(self):
+        import quote_quality_saved as saved
+        s=self.load(5);self.configure(s);s['run_step5']('build')
+        frame=s['step5_frame'];pointer=(self.folder/'latest.json').read_bytes()
+        with patch.object(saved,'save_step5_checkpoint',side_effect=OSError('synthetic disk full')):
+            try:s['run_step5']('validate')
+            except OSError:pass  # Memory retention also holds for a surfaced save error.
+        predictions=s['step5_predictions']
+        self.assertIsNotNone(predictions)
+        self.assertEqual(set(predictions.model),set(self.VERSIONS))
+        self.assertIs(s['step5_frame'],frame)
+        self.assertEqual((self.folder/'latest.json').read_bytes(),pointer)
+        self.assertFalse(s['step5_busy']);self.assertTrue(s['step5_clock_stop'].is_set())
+        self.assertFalse(s['step5_export'].disabled)
+        self.assertIn('retained',s['step5_status'].value)
+        with patch.dict(s,run_comparison=Mock(side_effect=AssertionError('export retry must not fit'))):
+            s['export_step5']()
+        self.assertIs(s['step5_predictions'],predictions)
+        restored,pred_saved,manifest=saved.load_saved_validation(self.folder)
+        pd.testing.assert_frame_equal(restored,frame)
+        pd.testing.assert_frame_equal(pred_saved,predictions)
+        self.assertTrue(manifest['validation_available'])
 
     def test_step5_interrupt_stops_timer_and_retains_completed_features(self):
-        s=self.load(5);s['run_step5']('build');built=s['step5_frame']
+        s=self.load(5);self.configure(s);s['run_step5']('build');built=s['step5_frame']
         with patch.dict(s,run_comparison=lambda *a,**k:(_ for _ in ()).throw(KeyboardInterrupt())):
             s['run_step5']('validate')
         self.assertIs(s['step5_frame'],built)

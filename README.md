@@ -31,8 +31,8 @@ Step2–4 share checked narrow-event Parquet caches under
 core code and cache schema identify the cache; changes or damaged files rebuild
 it. Raw values are preserved, timestamps are not rounded, and no-quote targets
 retain zero counts/NaN values. This is event reuse, not interrupted-model resume.
-Feature and prediction exports remain the durable outputs; automatic partial
-model checkpoint/resume and persistent test-lock restoration remain pending.
+Step5 saves completed features and predictions automatically. Partial-model
+resume remains unsupported; validation review never opens saved test predictions.
 
 Run revised Step1–4 sequentially in a separate research kernel; preserve the
 completed Step5 kernel. All notebooks still have three code cells and complete
@@ -43,12 +43,36 @@ sector findings and locked-test gains must come from the research data.
 
 # Saved validation and SECTOR review
 
-After Step5 finishes, use **Export features** once. Open
+Step5 now automatically saves completed full features, completed validation,
+and the locked choice before test fitting to independent snapshots under
+`outputs/quote_quality_step5/snapshots/`. `latest.json` is published only after
+all files and checksums are written. Old exports and snapshots remain intact;
+save failures retain in-memory results and do not report a successful save.
+**Export features** retries saving. Open
 `quote_quality_validation_review.ipynb` and run its three small cells. It reads
 existing `model_features.parquet`, `validation_predictions.parquet` and
 `experiment.json`, or uses the current kernel's completed frame and predictions.
 It never trains or opens test predictions. Do not restart the original kernel or
-rerun its controls cell just to view results.
+rerun data-loading cells just to view results. Rebuilding the controls cell now
+retains completed frames, predictions and the locked choice; it refuses to run
+while Step5 is busy. Changed inputs/settings block further fitting in that
+retained experiment. Review existing validation using Choice or the helper.
+
+The current finite recovery run declares **Base, Quote levels, Reliability and
+Age decay** before fitting. It uses the existing parameters, target, anchor,
+features and all target rows; it does not repeat the other four versions.
+The core API still defaults to all eight when no `versions` argument is supplied.
+Completed live validation disables repeat fitting. These safeguards do not make
+an already viewed test period unseen. After a kernel restart, saved validation
+can be reviewed by the helper; do not assume a new kernel means an unlocked test.
+
+For a hot update in the current idle Step5 kernel, save your local notebook edits,
+pull the updated files, and run **only the revised third controls cell**. It
+reloads the small core/review modules without loading data or building full
+features. It can redraw a preview if no full experiment exists. The four-version
+recovery starts only when **Run validation (4)** is clicked. Wait for its automatic
+save to complete before closing the kernel. No remote data is available to the
+repository checks; recovery and SECTOR findings still require the actual run.
 
 For an existing live Step5 session, one new cell is enough:
 
@@ -186,14 +210,15 @@ in training/evaluation raises an unassessed message. No price errors are used to
 
 1. Run the three cells: one-issuer preview shows coverage and rule effects.
 2. `Build all features` constructs the full experiment, including no-quote trades.
-3. `Run validation` compares all eight versions. The four panels show MAE, daily loss
+3. `Run validation (4)` compares the declared four-version recovery chain. The four panels show MAE, daily loss
    differences, same-row coverage/type/par-quantity subgroups and pooled P95 error.
 4. Choose using validation; `Run locked test` refits Base, the direct comparator
    and the chosen version on pre-test history with the same 2-date embargo. The
    selection is locked in the current session. Re-running the entire experiment
    does not make an already inspected test period unseen.
-5. `Export features` saves the feature frame, available predictions and an experiment
-   manifest under `outputs/quote_quality_step5/`; `Save all PNG` shares the current four panels.
+5. Features, predictions and an experiment manifest are saved automatically to
+   independent snapshots under `outputs/quote_quality_step5/`. `Export features`
+   retries saving; `Save all PNG` shares the current four panels.
 
 Issuer selection affects preview only; training always uses all issuers. Five test
 dates support a pilot assessment, not a final stability claim. There is no claim that

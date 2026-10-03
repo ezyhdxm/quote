@@ -3,6 +3,7 @@ from importlib.util import find_spec
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -111,6 +112,56 @@ class ModelProgressChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Insufficient'):
             qc.run_comparison(self.frame.iloc[:0], self.params, progress=record_into(failed))
         self.assertFalse(any(r[3].startswith('Finished') for r in failed))
+
+    def test_finite_validation_versions_match_full_predictions_and_requested_order(self):
+        full, _ = qc.run_comparison(self.frame, self.params)
+        versions = ['Age decay','Base','Reliability','Quote levels']
+        reports = []
+        frame_before = self.frame.copy(deep=True)
+        params_before = self.params.copy()
+        observed, models = qc.run_comparison(self.frame, self.params, 'Validation', None,
+            record_into(reports), versions)
+        expected = pd.concat([full.loc[full.model.eq(name)] for name in versions], ignore_index=True)
+        pd.testing.assert_frame_equal(observed, expected)
+        pd.testing.assert_frame_equal(self.frame, frame_before)
+        self.assertEqual(self.params, params_before)
+        self.assertEqual(list(models), versions)
+        self.assertEqual(observed.model.drop_duplicates().tolist(), versions)
+        self.assertEqual(models['Base'].feature_name_, qc.BASE_FEATURES)
+        for model in models.values():
+            for key, value in self.params.items():
+                self.assertEqual(model.get_params()[key], value)
+        self.assertEqual(reports[0][:3], ('models',0,4))
+        self.assertEqual(reports[-1][:3], ('models',4,4))
+        completed = [r[1] for r in reports if r[0]=='models' and r[3].startswith('Finished')]
+        self.assertEqual(completed, [1,2,3,4])
+        self.assertEqual([r[1] for r in reports if r[0]=='fit'], [0,10,12]*4)
+        self.assertTrue(observed.stage.eq('Validation').all())
+        self.assertEqual(set(observed.row_id), set(self.frame.loc[self.frame.split.eq('Validation'),'row_id']))
+        self.assertTrue(observed.train_n.eq(30).all())
+        # Changing every test target and input cannot alter validation fits/rows.
+        changed = self.frame.copy(deep=True)
+        test = changed.split.eq('Test')
+        for col in qc.BASE_FEATURES:
+            changed.loc[test,col] = 'UNSEEN_TEST' if col in qc.BASE_CAT_FEATURES else -999.0
+        changed.loc[test,[col for col in changed if col.startswith('bcq_')]] = -999.0
+        changed.loc[test,['D_BM_SPREAD','BM_SPREAD']] = np.nan
+        heldout_changed, _ = qc.run_comparison(changed, self.params, versions=versions)
+        pd.testing.assert_frame_equal(observed, heldout_changed)
+
+    def test_invalid_validation_versions_and_explicit_test_versions_fail_before_fit(self):
+        with patch('lightgbm.LGBMRegressor.fit', side_effect=AssertionError('unexpected fit')):
+            for versions, message in [([], 'nonempty'), (['Base','Base'], 'unique'),
+                (['Base','Unknown'], 'Unknown'), (['Quote levels'], 'include Base'),
+                ('Base', 'nonempty'), ([None,'Base'], 'model names'), (1, 'nonempty')]:
+                with self.subTest(versions=versions), self.assertRaisesRegex(ValueError, message):
+                    qc.run_comparison(self.frame, self.params, versions=versions)
+            reports = []
+            for versions in [[], ['Base'], ['Base','Quote levels','Reliability','Age decay']]:
+                with self.subTest(test_versions=versions), self.assertRaisesRegex(ValueError, 'only supported for Validation'):
+                    qc.run_comparison(self.frame, self.params, 'Test', 'Age decay',
+                        record_into(reports), versions)
+            self.assertFalse(reports)
 
 
 if __name__ == '__main__':

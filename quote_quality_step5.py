@@ -70,6 +70,9 @@ ALLOW_EXACT_QUOTES = True  # event time = known time; set False for strict-befor
 # Short-file pilot: use the final quote date as the predeclared experiment end.
 # These split settings differ from the older 60/10/10-day notebook to fit the short quote period.
 VALIDATION_DAYS, TEST_DAYS, EMBARGO_DAYS, MIN_TRAIN_DAYS = 5, 5, 2, 10
+# Recover only the existing comparison chain after an unsaved kernel result was lost.
+# This is declared before fitting; it does not change the model or evaluation rows.
+VALIDATION_VERSIONS = ('Base', 'Quote levels', 'Reliability', 'Age decay')
 LGB_PARAMS = dict(objective='mae',boosting_type='dart',n_estimators=400,learning_rate=.2,
     num_leaves=127,max_bin=511,max_depth=-1,min_child_samples=20,min_split_gain=0.,
     subsample=1.,subsample_freq=0,colsample_bytree=1.,reg_alpha=0.,reg_lambda=0.,
@@ -159,13 +162,27 @@ def validation_figure(frame, predictions=None, focus=None, stage='Readiness', ti
 # %% [markdown]
 # ## Run and export
 # Preview one issuer for speed; training always builds the full experiment, with no screenshot-selected sample.
-# Build all features writes no file until Export is clicked. Export keeps row_id, original baseline columns and features.
+# Completed features and predictions are saved automatically to independent snapshots.
+# Export features retries saving; old exports and completed snapshots are never overwritten.
 # Validation reports MAE, day-level differences, coverage/side/size slices and tail errors together.
 # Test refits the locked choice and its comparison baselines on pre-test data. Re-running controls never tunes on test.
 # Progress shows completed bonds/models and current training iterations; elapsed time updates every second.
 # Preprocessing has no reliable percentage. Keep the existing run; progress cannot attach to an older running cell.
 
 # %% 3. Research controls
+if globals().get('step5_busy',False):
+    raise RuntimeError('Step5 is running. Wait for completion; rebuilding controls cannot attach to active work.')
+# A hot update reads only the revised functions; no loader, features or fits run.
+import importlib
+import quote_quality_core as step5_core
+import quote_quality_saved as step5_saved
+importlib.reload(step5_core);importlib.reload(step5_saved)
+run_comparison=step5_core.run_comparison
+model_versions=step5_core.model_versions
+if 'VALIDATION_VERSIONS' not in globals():
+    VALIDATION_VERSIONS=('Base','Quote levels','Reliability','Age decay')
+step5_previous_choice=globals().get('step5_selected')
+step5_previous_choice=getattr(step5_previous_choice,'value',None)
 if 'step5_dashboard' in globals():
     if 'step5_clock_stop' in globals():step5_clock_stop.set()
     for button,callback in step5_callbacks:button.on_click(callback,remove=True)
@@ -174,7 +191,7 @@ if 'step5_dashboard' in globals():
 step5_issuer=widgets.Dropdown(options=representative_issuers(bcq_df),description='Preview:',layout=widgets.Layout(width='850px'))
 step5_preview=widgets.Button(description='Preview issuer')
 step5_build=widgets.Button(description='Build all features')
-step5_validate=widgets.Button(description='Run validation',button_style='primary')
+step5_validate=widgets.Button(description=f'Run validation ({len(VALIDATION_VERSIONS)})',button_style='primary')
 step5_test=widgets.Button(description='Run locked test',disabled=True)
 step5_selected=widgets.Dropdown(options=['Base'],description='Choice:',disabled=True)
 step5_export=widgets.Button(description='Export features')
@@ -185,8 +202,77 @@ step5_rounds=widgets.IntProgress(description='Iterations:',min=0,max=1,value=0,l
 step5_detail=widgets.HTML();step5_elapsed=widgets.HTML()
 step5_clock_stop=Event()
 step5_progress_state={'last_update':0.,'context':''}
-step5_frame=None;step5_predictions=None;step5_test_predictions=None;step5_locked=None;step5_busy=False
-step5_event_cache=None
+# Rebuilding the UI must retain completed work and the locked test choice.
+for name,default in [('step5_frame',None),('step5_predictions',None),
+                     ('step5_test_predictions',None),('step5_locked',None),
+                     ('step5_event_cache',None),('step5_last_checkpoint',None),
+                     ('step5_result_metadata',None),('step5_saved_lock_guard',False)]:
+    if name not in globals():globals()[name]=default
+step5_busy=False
+if step5_frame is None and step5_predictions is None and step5_locked is None:
+    try:
+        saved_metadata,saved_path=step5_saved.load_step5_metadata()
+        if saved_metadata.get('locked_choice') is not None or saved_metadata.get('test_available'):
+            step5_locked=saved_metadata.get('locked_choice')
+            step5_saved_lock_guard=True
+            step5_last_checkpoint=saved_path
+    except FileNotFoundError:
+        saved_folder=Path('outputs/quote_quality_step5')
+        if (saved_folder/'latest.json').is_file() or (saved_folder/'test_predictions.parquet').is_file():
+            step5_saved_lock_guard=True  # broken existing save is not evidence of an unopened test
+    except (ValueError,OSError) as error:
+        step5_saved_lock_guard=True
+        step5_status.value=escape(f'Saved experiment cannot be verified: {error}. Review it before fitting.')
+
+
+def step5_experiment_metadata(include_model_columns=True):
+    # File stats and exact settings identify this run without hashing 39M raw quotes again.
+    specs=model_versions(step5_frame)[1] if include_model_columns else {}
+    files={}
+    for path in [DATA_IG_CACHE,RAW_QUOTES_FILE]:
+        if path.is_file():
+            stat=path.stat()
+            files[str(path)]=dict(size=stat.st_size,mtime_ns=stat.st_mtime_ns)
+    return dict(base_features=BASE_FEATURES,target=TARGET_COL,anchor=ANCHOR_COL,
+        error_multiplier=100,quote_spread_unit='bps',allow_exact_quotes=ALLOW_EXACT_QUOTES,
+        age_min=AGE_MIN,sync_min=SYNC_MIN,lgb_params=LGB_PARAMS,
+        val_days=VALIDATION_DAYS,test_days=TEST_DAYS,embargo_days=EMBARGO_DAYS,
+        validation_versions=list(VALIDATION_VERSIONS),
+        model_columns={name:columns for name,(columns,_) in specs.items()},
+        quote_file_dates=[bcq_df.quote_timestamp_ET.min().isoformat(),bcq_df.quote_timestamp_ET.max().isoformat()],
+        input_files=files,event_cache_key=step5_event_cache.get('cache_key') if step5_event_cache is not None else None)
+
+
+def checkpoint_step5():
+    global step5_last_checkpoint,step5_result_metadata
+    if step5_frame is None:raise ValueError('No completed full feature frame to save')
+    from quote_quality_saved import save_step5_checkpoint
+    if step5_result_metadata is None:
+        from copy import deepcopy
+        step5_result_metadata=deepcopy(step5_experiment_metadata())
+        step5_result_metadata['settings_origin']='legacy_live_settings_at_capture' if step5_predictions is not None else 'captured_before_fitting'
+    metadata=dict(step5_result_metadata,locked_choice=step5_locked)
+    if step5_predictions is not None:
+        metadata['validation_versions']=step5_predictions.model.drop_duplicates().tolist()
+    step5_detail.value='Saving completed results; previous snapshots remain available...'
+    step5_last_checkpoint=save_step5_checkpoint(step5_frame,step5_predictions,
+        step5_test_predictions,metadata=metadata,folder=Path('outputs/quote_quality_step5'))
+    step5_detail.value=escape(f'Saved completed results to {step5_last_checkpoint}')
+    return step5_last_checkpoint
+
+
+def step5_matches_saved_context():
+    # Existing results remain viewable, but changed inputs/settings cannot silently
+    # drive another fit or held-out test in their experiment.
+    columns=['row_id','cusip','time',TARGET_COL,ANCHOR_COL,'BM_SPREAD','split','refit_train']+BASE_FEATURES
+    columns=list(dict.fromkeys(columns))
+    if not step5_frame[columns].reset_index(drop=True).equals(model_data[columns].reset_index(drop=True)):return False
+    if step5_result_metadata is None:return True  # legacy live results; do not invent old run metadata
+    current=step5_experiment_metadata(include_model_columns=False)
+    fields=['target','anchor','base_features','error_multiplier','allow_exact_quotes',
+            'age_min','sync_min','lgb_params','val_days','test_days','embargo_days',
+            'validation_versions','quote_file_dates','input_files']
+    return all(step5_result_metadata.get(field)==current.get(field) for field in fields)
 
 
 def report_step5(stage,completed=None,total=None,detail=''):
@@ -221,6 +307,15 @@ def step5_clock(stop,started,widget):
 def run_step5(action='preview'):
     global step5_frame,step5_predictions,step5_test_predictions,step5_locked,step5_figure,step5_busy,step5_clock_stop,step5_event_cache
     if step5_busy:return
+    if action!='preview' and step5_saved_lock_guard:
+        step5_status.value='Saved experiment has a locked test or cannot be verified. Review saved validation with the helper; no new fit/test runs here.'
+        return
+    if action=='validate' and step5_predictions is not None:
+        step5_status.value='Completed validation remains in memory. Use Choice or the SECTOR helper to review it.'
+        show_step5_choice();return
+    if action in ['validate','test'] and step5_frame is not None and not step5_matches_saved_context():
+        step5_status.value='Existing results retained for review. Inputs or settings changed; do not fit/test under this experiment.'
+        return
     step5_busy=True
     for button in [step5_preview,step5_build,step5_validate,step5_test,step5_export,step5_save]:button.disabled=True
     step5_selected.disabled=True;step5_issuer.disabled=True
@@ -246,20 +341,26 @@ def run_step5(action='preview'):
                     step5_event_cache=prepare_quote_events(bcq_df,progress=report_step5)
                 features=build_quote_features(bcq_df,model_data[['row_id','cusip','time']],AGE_MIN,SYNC_MIN,ALLOW_EXACT_QUOTES,progress=report_step5,event_cache=step5_event_cache)
                 step5_frame=model_data.merge(features.drop(columns=['cusip','time']),on='row_id',validate='one_to_one')
+                checkpoint_step5()
             else:
                 n_bonds=step5_frame.cusip.nunique()
                 report_step5('features',n_bonds,n_bonds,'Reusing completed in-memory feature frame')
             if action=='validate':
                 if step5_locked is not None:raise ValueError('Test choice is already locked. Start a new experiment explicitly before changing it.')
-                step5_predictions,_=run_comparison(step5_frame,LGB_PARAMS,progress=report_step5)
+                step5_predictions,_=run_comparison(step5_frame,LGB_PARAMS,progress=report_step5,versions=VALIDATION_VERSIONS)
+                checkpoint_step5()
                 order=step5_predictions.groupby('model').abs_error_bps.mean().sort_values().index.tolist()
                 step5_selected.options=order;step5_selected.value=order[0]
                 step5_figure=validation_figure(step5_frame,step5_predictions,step5_selected.value,'Validation')
             elif action=='test':
                 if step5_predictions is None:raise ValueError('Run validation before opening the final test')
-                if step5_locked is None:step5_locked=step5_selected.value
+                if step5_locked is None:
+                    step5_locked=step5_selected.value
+                    checkpoint_step5()  # persist the choice before evaluating the held-out test
                 step5_selected.disabled=True
-                if step5_test_predictions is None:step5_test_predictions,_=run_comparison(step5_frame,LGB_PARAMS,'Test',step5_locked,progress=report_step5)
+                if step5_test_predictions is None:
+                    step5_test_predictions,_=run_comparison(step5_frame,LGB_PARAMS,'Test',step5_locked,progress=report_step5)
+                    checkpoint_step5()
                 step5_figure=validation_figure(step5_frame,step5_test_predictions,step5_locked,'Locked test')
             else:step5_figure=validation_figure(step5_frame)
         step5_detail.value='Rendering the four-panel dashboard...'
@@ -267,13 +368,13 @@ def run_step5(action='preview'):
             step5_figure.savefig(buffer,format='png',dpi=110);step5_image.value=buffer.getvalue()
         step5_save.disabled=False
         step5_progress.bar_style='success';step5_rounds.bar_style='success'
-        step5_detail.value='Complete. Features and predictions remain in this kernel; use Export features to save.'
+        step5_detail.value=escape(f'Complete. Full experiment saved to {step5_last_checkpoint}') if action!='preview' else 'Issuer preview only; full experiment results are unchanged.'
         step5_status.value='Finished. All four panels are ready to share; no large tables printed.'
     except KeyboardInterrupt:
         step5_status.value='Interrupted. Any fully built feature frame remains in this kernel; partial model results are not saved.'
         step5_progress.bar_style='warning';step5_rounds.bar_style='warning'
     except Exception as error:
-        step5_status.value=escape(f'{type(error).__name__}: {error}')
+        step5_status.value=escape(f'{type(error).__name__}: {error}. Completed in-memory results are retained; Export features retries saving.')
         step5_progress.bar_style='danger';step5_rounds.bar_style='danger'
         step5_save.disabled=True
         if not isinstance(error,ValueError):raise
@@ -286,34 +387,18 @@ def run_step5(action='preview'):
         step5_issuer.disabled=False
         step5_export.disabled=step5_frame is None
         step5_selected.disabled=step5_predictions is None or step5_locked is not None
-        step5_validate.disabled=step5_locked is not None
-        step5_test.disabled=step5_predictions is None
+        step5_validate.disabled=step5_saved_lock_guard or step5_locked is not None or step5_predictions is not None
+        step5_test.disabled=step5_saved_lock_guard or step5_predictions is None
 
 
 def export_step5(_=None):
     if step5_frame is None:
         step5_status.value='Build all features before exporting.';return
-    folder=Path('outputs/quote_quality_step5');folder.mkdir(parents=True,exist_ok=True)
-    export,specs=model_versions(step5_frame)
-    export.to_parquet(folder/'model_features.parquet',index=False)
-    for label,pred in [('validation',step5_predictions),('test',step5_test_predictions)]:
-        if pred is not None:pred.to_parquet(folder/f'{label}_predictions.parquet',index=False)
-    import json
-    manifest=dict(base_features=BASE_FEATURES,target=TARGET_COL,anchor=ANCHOR_COL,
-        error_multiplier=100,quote_spread_unit='bps',allow_exact_quotes=ALLOW_EXACT_QUOTES,
-        age_min=AGE_MIN,sync_min=SYNC_MIN,lgb_params=LGB_PARAMS,locked_choice=step5_locked,
-        val_days=VALIDATION_DAYS,test_days=TEST_DAYS,embargo_days=EMBARGO_DAYS,
-        model_columns={name:columns for name,(columns,_) in specs.items()},
-        validation_available=step5_predictions is not None,
-        quote_file_dates=[bcq_df.quote_timestamp_ET.min().isoformat(),bcq_df.quote_timestamp_ET.max().isoformat()],
-        event_cache_key=step5_event_cache.get('cache_key') if step5_event_cache is not None else None,
-        split_dates={label:sorted(group.time.dt.strftime('%Y-%m-%d').unique()) for label,group in step5_frame.groupby('split')})
-    import hashlib
-    saved_validation_files=['model_features.parquet']+(['validation_predictions.parquet'] if step5_predictions is not None else [])
-    manifest['validation_files_sha256']={name:hashlib.sha256((folder/name).read_bytes()).hexdigest()
-        for name in saved_validation_files}
-    (folder/'experiment.json').write_text(json.dumps(manifest,indent=2))
-    step5_status.value=f'Saved features, experiment settings and available predictions to {folder}'
+    try:
+        folder=checkpoint_step5()
+        step5_status.value=escape(f'Saved features, experiment settings and available predictions to {folder}')
+    except Exception as error:
+        step5_status.value=escape(f'Save failed: {error}. Results remain in memory; previous snapshots are unchanged.')
 
 
 def save_step5(_=None):
@@ -336,4 +421,26 @@ for button,callback in step5_callbacks:button.on_click(callback)
 step5_selected.observe(show_step5_choice,names='value')
 step5_dashboard=widgets.VBox([step5_issuer,widgets.HBox([step5_preview,step5_build,step5_validate]),widgets.HBox([step5_selected,step5_test,step5_export,step5_save]),step5_status,step5_progress,step5_rounds,step5_detail,step5_elapsed,step5_image])
 display(step5_dashboard)
-run_step5('preview')
+if step5_predictions is not None:
+    order=step5_predictions.groupby('model').abs_error_bps.mean().sort_values().index.tolist()
+    step5_selected.options=order
+    choice=step5_locked or step5_previous_choice
+    step5_selected.value=choice if choice in order else order[0]
+    step5_figure=validation_figure(step5_frame,step5_predictions,step5_selected.value,'Validation')
+    step5_status.value='Completed validation retained. No feature build or training was repeated.'
+elif step5_frame is not None:
+    step5_figure=validation_figure(step5_frame)
+    step5_status.value='Completed full feature frame retained. No feature build was repeated.'
+else:
+    run_step5('preview')
+if step5_frame is not None:
+    with BytesIO() as buffer:
+        step5_figure.savefig(buffer,format='png',dpi=110);step5_image.value=buffer.getvalue()
+    step5_save.disabled=False
+    step5_export.disabled=False
+    step5_selected.disabled=step5_predictions is None or step5_locked is not None
+    step5_validate.disabled=step5_saved_lock_guard or step5_predictions is not None or step5_locked is not None
+    step5_test.disabled=step5_saved_lock_guard or step5_predictions is None
+if step5_saved_lock_guard:
+    step5_build.disabled=True;step5_validate.disabled=True;step5_test.disabled=True
+    step5_status.value='Saved experiment is locked or unverifiable. Use the saved-validation helper; restarting the kernel does not unlock the test.'

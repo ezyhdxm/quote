@@ -516,11 +516,32 @@ def chronological_split(frame, quote_end, val_days=5, test_days=5, embargo_days=
     return split,refit
 
 
-def run_comparison(frame, params, stage='Validation', selected=None, progress=None):
-    """Predict D_BM_SPREAD + PREV_BM_SPREAD; same target rows for every version."""
+def run_comparison(frame, params, stage='Validation', selected=None, progress=None, versions=None):
+    """Same target rows and BASE14; optional finite Validation versions include Base.
+
+    None retains the eight-version comparison. Test uses its locked selected
+    version and existing references, so an explicit versions list is rejected.
+    """
     import lightgbm as lgb
     if stage not in ['Validation','Test']: raise ValueError('Unknown evaluation stage')
+    if stage=='Test' and versions is not None:
+        raise ValueError('versions is only supported for Validation; Test uses the locked selected version')
     x,specs=model_versions(frame)
+    if versions is not None:
+        try:
+            requested=list(versions) if not isinstance(versions,str) else []
+        except TypeError:
+            raise ValueError('versions must be a nonempty list of model names including Base') from None
+        if not requested or any(not isinstance(name,str) for name in requested):
+            raise ValueError('versions must be a nonempty list of model names including Base')
+        if len(requested)!=len(set(requested)):
+            raise ValueError('versions must contain unique model names')
+        unknown=[name for name in requested if name not in specs]
+        if unknown:
+            raise ValueError('Unknown model versions: '+', '.join(unknown))
+        if 'Base' not in requested:
+            raise ValueError('versions must include Base')
+        specs={name:specs[name] for name in requested}
     if stage=='Test':
         if selected not in specs: raise ValueError('Choose a validation-selected version before testing')
         reference='Base' if selected in ['Base','Quote levels'] else ('Quote levels' if selected=='Reliability' else 'Reliability')

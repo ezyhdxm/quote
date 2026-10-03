@@ -2,9 +2,114 @@
 from pathlib import Path
 import hashlib
 import json
+import os
+import tempfile
+from uuid import uuid4
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def save_step5_checkpoint(frame, predictions=None, test_predictions=None, metadata=None,
+                          folder='outputs/quote_quality_step5'):
+    """Save a new immutable snapshot, then atomically publish latest.json.
+
+    Neither flat exports nor earlier snapshots are rewritten. A failed write
+    leaves the previous latest pointer usable and propagates its exception.
+    No models are run and no test predictions are read or evaluated here.
+    """
+    if frame is None:
+        raise ValueError('A completed feature frame is required before saving a checkpoint')
+    if not {'row_id', 'time', 'split', 'BM_SPREAD'}.issubset(frame):
+        raise ValueError('The checkpoint needs the complete Step5 feature frame')
+    if frame.row_id.duplicated().any():
+        raise ValueError('Feature frame row_id must be unique')
+    available = predictions is not None and not predictions.empty
+    if available:
+        validation_rows(frame, predictions)
+    from quote_quality_core import BASE_FEATURES, to_ny_datetime
+    manifest = dict(metadata or {})
+    for name, value in [('base_features', list(BASE_FEATURES)), ('target', 'D_BM_SPREAD'),
+                        ('anchor', 'PREV_BM_SPREAD'), ('error_multiplier', 100),
+                        ('quote_spread_unit', 'bps'), ('allow_exact_quotes', True),
+                        ('locked_choice', None)]:
+        manifest.setdefault(name, value)
+    manifest['validation_available'] = available
+    manifest['test_available'] = test_predictions is not None and not test_predictions.empty
+    et_time = to_ny_datetime(frame.time)
+    split_days = pd.DataFrame({'split': frame['split'].to_numpy(),
+                               'date': et_time.dt.strftime('%Y-%m-%d').to_numpy()})
+    manifest['split_dates'] = {
+        str(label): sorted(group.date.dropna().unique().tolist())
+        for label, group in split_days.groupby('split', observed=True)}
+    folder = Path(folder)
+    snapshot = folder / 'snapshots' / uuid4().hex
+    snapshot.mkdir(parents=True, exist_ok=False)
+    # Each file is new, inside this attempt's unique directory. An interruption
+    # can leave an unreferenced partial snapshot, never a partially updated save.
+    frame.to_parquet(snapshot / 'model_features.parquet', index=False)
+    files = ['model_features.parquet']
+    if available:
+        predictions.to_parquet(snapshot / 'validation_predictions.parquet', index=False)
+        files.append('validation_predictions.parquet')
+    if manifest['test_available']:
+        test_predictions.to_parquet(snapshot / 'test_predictions.parquet', index=False)
+        files.append('test_predictions.parquet')
+    manifest['files_sha256'] = {name: _file_sha256(snapshot / name) for name in files}
+    manifest['validation_files_sha256'] = {
+        name: manifest['files_sha256'][name] for name in files
+        if name in ['model_features.parquet', 'validation_predictions.parquet']}
+    manifest['checkpoint_schema'] = 1
+    manifest_path = snapshot / 'experiment.json'
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    pointer = dict(schema=1, snapshot=snapshot.relative_to(folder).as_posix(),
+                   experiment_sha256=_file_sha256(manifest_path))
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=folder, prefix='.latest-', suffix='.json',
+                                         mode='w', encoding='utf-8', delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(pointer, temporary, indent=2)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.replace(folder / 'latest.json')
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return snapshot
+
+
+def _saved_validation_location(folder):
+    """Resolve only a snapshot inside the requested folder; old exports still work."""
+    folder = Path(folder)
+    pointer_path = folder / 'latest.json'
+    if not pointer_path.is_file():
+        return folder, None
+    pointer = json.loads(pointer_path.read_text(encoding='utf-8'))
+    if not isinstance(pointer, dict):
+        raise ValueError('Saved Step5 latest.json has an invalid snapshot pointer')
+    relative = pointer.get('snapshot')
+    if pointer.get('schema') != 1 or not isinstance(relative, str) or not relative:
+        raise ValueError('Saved Step5 latest.json has an invalid snapshot pointer')
+    path = Path(relative)
+    if path.is_absolute() or '..' in path.parts:
+        raise ValueError('Saved Step5 snapshot must stay inside its output folder')
+    snapshot = (folder / path).resolve()
+    root = folder.resolve()
+    if snapshot == root or not snapshot.is_relative_to(root):
+        raise ValueError('Saved Step5 snapshot must stay inside its output folder')
+    expected = pointer.get('experiment_sha256')
+    if not isinstance(expected, str) or not expected:
+        raise ValueError('Saved Step5 snapshot is missing its experiment checksum')
+    return snapshot, expected
 
 
 def direct_reference(selected):
@@ -134,16 +239,52 @@ def sector_figure(result):
     return fig
 
 
+def load_step5_metadata(folder='outputs/quote_quality_step5'):
+    """Read only experiment metadata, including a persisted test choice lock.
+
+    No feature/prediction Parquet is opened or hashed. A frame-only checkpoint
+    can restore its lock even when completed validation is not available.
+    """
+    folder, manifest_hash = _saved_validation_location(folder)
+    manifest_path = folder / 'experiment.json'
+    if not manifest_path.is_file():
+        raise FileNotFoundError('No saved Step5 checkpoint/export was found. Keep any live feature frame and predictions; this viewer does not train.')
+    if manifest_hash is not None and _file_sha256(manifest_path) != manifest_hash:
+        raise ValueError('Saved Step5 experiment.json differs from its latest.json checksum')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if not isinstance(manifest, dict):
+        raise ValueError('Saved Step5 experiment.json must contain an experiment object')
+    return manifest, folder.resolve()
+
+
 def load_saved_validation(folder='outputs/quote_quality_step5'):
-    folder = Path(folder)
-    manifest = json.loads((folder / 'experiment.json').read_text())
+    has_pointer = (Path(folder) / 'latest.json').is_file()
+    manifest, folder = load_step5_metadata(folder)
     if manifest.get('validation_available') is False:
-        raise ValueError('This export has no completed validation; any older prediction file is not reusable')
-    for filename, expected in manifest.get('validation_files_sha256', {}).items():
+        raise ValueError('Features were saved, but this checkpoint/export has no completed validation. Any older prediction file is not reusable.')
+    checksums = manifest.get('validation_files_sha256', {})
+    if not isinstance(checksums, dict):
+        raise ValueError('Saved Step5 validation file checksums must be a filename mapping')
+    if has_pointer or 'checkpoint_schema' in manifest:
+        required = {'model_features.parquet', 'validation_predictions.parquet'}
+        if manifest.get('checkpoint_schema') != 1 or not required.issubset(checksums):
+            raise ValueError('Saved Step5 validation checkpoint is missing required file checksums')
+        all_checksums = manifest.get('files_sha256', {})
+        if not isinstance(all_checksums, dict):
+            raise ValueError('Saved Step5 snapshot file checksums must be a filename mapping')
+        if any(all_checksums.get(name) != checksums[name] for name in required):
+            raise ValueError('Saved Step5 validation checkpoint file checksums disagree')
+    for filename, expected in checksums.items():
         if filename not in ['model_features.parquet', 'validation_predictions.parquet']:
             raise ValueError('Invalid validation manifest filename')
-        if hashlib.sha256((folder / filename).read_bytes()).hexdigest() != expected:
-            raise ValueError('Saved validation file differs from its manifest: ' + filename)
+        if not (folder / filename).is_file():
+            raise FileNotFoundError('Saved Step5 validation file is missing: ' + filename)
+        if _file_sha256(folder / filename) != expected:
+            raise ValueError('Saved validation file checksum differs from its manifest: ' + filename)
+    if not (folder / 'model_features.parquet').is_file():
+        raise FileNotFoundError('Saved Step5 full feature frame is missing from this checkpoint/export.')
+    if not (folder / 'validation_predictions.parquet').is_file():
+        raise FileNotFoundError('No saved completed validation predictions were found in this checkpoint/export.')
     frame = pd.read_parquet(folder / 'model_features.parquet')
     predictions = pd.read_parquet(folder / 'validation_predictions.parquet')
     rows, _ = validation_rows(frame, predictions)
